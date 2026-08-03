@@ -1,6 +1,7 @@
 # Install with: uv pip install -r requirements.txt --torch-backend=auto
 # (torch needs the CUDA 13 build for Blackwell / sm_120; --torch-backend=auto picks it)
 torch==2.13.0
+torchvision==0.28.0
 # MiniMax-H3 support is not in a diffusers release yet; pinned to the integration PR
 # https://github.com/huggingface/diffusers/pull/14355
 diffusers @ git+https://github.com/huggingface/diffusers.git@abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc
