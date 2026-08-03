@@ -1,0 +1,8 @@
+# Project Intelligence: minimaxh3
+
+- Read all files in memory-bank/ at session start; techContext.md has the machine-specific gotchas.
+- GPU is shared: `vllm.service` (user systemd) normally occupies ~93GB VRAM. Stop it before
+  generation, and remember the user's Qwen endpoint on port 8000 goes down when you do.
+- Always use `HF_HOME=~/.cache/hf` — the default HF cache is root-owned and sudo is interactive.
+- diffusers is pinned to a PR commit; MiniMax-H3 is not in a diffusers release yet.
+- User prefers single quotes for static CLI arguments.
