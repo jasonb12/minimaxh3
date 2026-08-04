@@ -41,7 +41,17 @@ hf download MiniMaxAI/MiniMax-H3 --include 'modular_model_index.json' 'transform
 > The GPU must be free first — stop the vLLM server if it's running:
 > `systemctl --user stop vllm.service` (restart later with `start`).
 
-## Usage
+## Web UI
+
+```bash
+.venv/bin/python app.py
+```
+
+Serves Gradio on `http://0.0.0.0:7860` (LAN-reachable, no auth — don't expose past the LAN).
+The model loads lazily on the first generation (~30s) and stays resident; requests queue up
+one at a time. Outputs are saved to `outputs/gradio/`.
+
+## CLI usage
 
 ```bash
 source .venv/bin/activate

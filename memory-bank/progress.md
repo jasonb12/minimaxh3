@@ -2,6 +2,10 @@
 
 ## Works
 
+- Gradio web UI (`app.py`) on port 7860: prompt + optional first/last frame images,
+  canvas presets, duration/steps/seed controls, queued single-slot generation,
+  lazy pipeline load with a friendly error if vLLM holds the GPU.
+
 - Full t2va pipeline on the single 96GB Blackwell card: int8 text encoder + bf16 transformer
   + ComponentsManager auto CPU offload.
 - Smoke test: 124 frames @ 960x544 with stereo audio in 248s of denoising (21s load).
