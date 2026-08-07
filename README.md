@@ -52,6 +52,20 @@ Pick **FL2VA** (text / first-last frame) or **Ref2VA** (reference images/video/a
 transformer partition loads lazily on first use; switching modes reloads ~62GB of weights.
 Requests queue one at a time. Outputs land in `outputs/gradio/`.
 
+## REST API
+
+The same server exposes a job-based REST API on port 7860 ([docs/API.md](docs/API.md),
+Swagger at `/api/docs`). Submit, poll, download:
+
+```bash
+JOB=$(curl -s http://localhost:7860/api/generate -H 'Content-Type: application/json' \
+  -d '{"prompt": "A red panda waves. overall_soundscape: forest ambience.", "turbo": true}' | jq -r .job_id)
+curl -s http://localhost:7860/api/jobs/$JOB | jq          # queued -> running -> done
+curl -o out.mp4 http://localhost:7860/api/jobs/$JOB/video
+```
+
+FL2VA only (first/last frame via `image_b64`/`image_url`); videos persist in `outputs/api/`.
+
 ## CLI usage
 
 ```bash

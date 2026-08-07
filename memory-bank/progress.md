@@ -2,6 +2,11 @@
 
 ## Works
 
+- REST API (docs/API.md) on the same port as the UI: job-based
+  submit/poll/download under `/api/*`, FL2VA only, first/last frame via
+  base64 or URL. Jobs in memory, mp4s in `outputs/api/`. Verified end-to-end
+  with a turbo job (50s gen) plus validation/404 paths.
+
 - Turbo LoRA (docs/TURBO.md): 4-eval sampling via `--turbo` / web UI checkbox,
   ~5.3x wall-clock speedup, verified on CLI and through the Gradio API.
   Preview-quality caveats (plastic skin, grain) tunable via strength.

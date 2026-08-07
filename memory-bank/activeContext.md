@@ -2,6 +2,18 @@
 
 ## Current focus (2026-08-07)
 
+REST API added to `app.py`: FastAPI routes mounted alongside Gradio on the
+same port (7860) via `gr.mount_gradio_app` + uvicorn. `POST /api/generate`
+returns a job id; `GET /api/jobs/{id}` polls; `GET /api/jobs/{id}/video`
+downloads the mp4 (persisted in `outputs/api/`). Single worker thread; UI and
+API share `_gen_lock` (turbo adapter toggle mutates shared transformer state,
+so generations must serialize). FL2VA only over REST — Ref2VA stays on the UI
+/ `/gradio_api`. Swagger at `/api/docs`. Documented in docs/API.md. Verified
+end-to-end (turbo job: 50s, h264+aac output, validation/404 paths checked).
+Server runs via nohup, log at `logs/app.log`.
+
+## Previous focus: Turbo LoRA (2026-08-07)
+
 Turbo LoRA integrated: community 4-step distillation LoRA
 (larryvrh/MiniMax-H3-Turbo-Lora) applied via `turbo.py` key remapping +
 PEFT adapter. Measured 248s -> 47s end-to-end at 960x544/5.2s. `--turbo` on
@@ -10,7 +22,7 @@ Full solution documented in docs/TURBO.md — read it before touching the
 remapping (the fc1 half-swap and the "no custom sampler needed" reasoning are
 non-obvious).
 
-## Previous focus
+## Previous focus: Ref2VA (2026-08-04)
 
 Ref2VA wired up (2026-08-04). `generate.py` and `app.py` support both FL2VA
 (`transformer/`) and Ref2VA (`transformer_ref/` via `MiniMaxH3Ref2VABlocks`).

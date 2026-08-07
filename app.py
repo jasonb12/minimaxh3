@@ -1,24 +1,38 @@
 #!/usr/bin/env python
-"""Web UI for MiniMax-H3 video+audio generation.
+"""Web UI + REST API for MiniMax-H3 video+audio generation.
 
-Serves Gradio on 0.0.0.0:7860 so it is reachable from other machines on the
-network. The pipeline loads lazily on the first generation (~30s) and stays
-resident afterwards; requests are serialized through the queue since the model
-saturates the GPU. Switching between FL2VA and Ref2VA reloads the transformer
-partition (~62GB) once.
+Serves on 0.0.0.0:7860, reachable from other machines on the network:
+  /            Gradio UI (and its own machine API under /gradio_api)
+  /api/*       job-based REST API (see docs/API.md):
+                 POST /api/generate        -> {"job_id": ...}
+                 GET  /api/jobs/{id}       -> status / info / error
+                 GET  /api/jobs/{id}/video -> the mp4
+                 GET  /api/jobs            -> recent jobs
+
+The pipeline loads lazily on the first generation (~30s) and stays resident;
+UI and API requests share one GPU lock, so they serialize. Switching between
+FL2VA and Ref2VA reloads the transformer partition (~62GB) once.
 
 Run:  .venv/bin/python app.py
 """
 
+import base64
 import gc
+import io
 import os
+import queue
 import threading
 import time
+import traceback
+import uuid
 from pathlib import Path
 
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 
 import gradio as gr
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from generate import build_pipeline, build_references
 
@@ -41,6 +55,10 @@ MODE_REF2VA = "Reference images/video/audio (Ref2VA)"
 _pipe = None
 _pipe_task = None
 _pipe_lock = threading.Lock()
+
+# One generation at a time: the model saturates the GPU, and the turbo adapter
+# toggle mutates shared transformer state. Held by both the UI and API paths.
+_gen_lock = threading.Lock()
 
 
 def _check_gpu_free() -> None:
@@ -93,6 +111,39 @@ def _mode_visibility(mode):
     )
 
 
+def _run_generation(task, kwargs, turbo, turbo_strength, out_path):
+    """Toggle turbo, run the pipeline, and encode the mp4.
+
+    Shared by the Gradio UI and the REST API; serialized on _gen_lock because
+    the turbo adapter toggle mutates shared transformer state and the model
+    saturates the GPU anyway. Returns generation wall time in seconds.
+    """
+    from diffusers.utils.export_utils import encode_video
+
+    with _gen_lock:
+        pipe = _get_pipe(task)
+        if task == "fl2va":
+            from turbo import load_turbo_lora, set_turbo_enabled
+
+            if turbo:
+                load_turbo_lora(pipe.transformer, strength=float(turbo_strength))
+            set_turbo_enabled(pipe.transformer, turbo)
+
+        t0 = time.time()
+        state = pipe(**kwargs)
+        elapsed = time.time() - t0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    encode_video(
+        state.get("videos")[0],
+        fps=24,
+        output_path=str(out_path),
+        audio=state.get("audio")[0],
+        audio_sample_rate=state.get("sampling_rate"),
+    )
+    return elapsed
+
+
 def generate(
     mode,
     prompt,
@@ -110,7 +161,6 @@ def generate(
     progress=gr.Progress(),
 ):
     import torch
-    from diffusers.utils.export_utils import encode_video
 
     if not prompt or not prompt.strip():
         raise gr.Error("A prompt is required.")
@@ -154,16 +204,6 @@ def generate(
     if turbo and task == "ref2va":
         raise gr.Error("Turbo is trained against the FL2VA transformer; switch mode or disable Turbo.")
 
-    progress(0, desc=f"Loading {task} pipeline (first run / mode switch takes a bit)")
-    pipe = _get_pipe(task)
-
-    if task == "fl2va":
-        from turbo import load_turbo_lora, set_turbo_enabled
-
-        if turbo:
-            load_turbo_lora(pipe.transformer, strength=float(turbo_strength))
-        set_turbo_enabled(pipe.transformer, turbo)
-
     kwargs = {
         "prompt": prompt.strip(),
         "num_frames": num_frames,
@@ -182,20 +222,8 @@ def generate(
             kwargs["last_image"] = last_image
 
     progress(0.05, desc=f"Generating {num_frames / 24:.1f}s of video (takes minutes)")
-    t0 = time.time()
-    state = pipe(**kwargs)
-    elapsed = time.time() - t0
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / f"h3_{task}_{time.strftime('%Y%m%d_%H%M%S')}_seed{seed}.mp4"
-    progress(0.95, desc="Encoding mp4")
-    encode_video(
-        state.get("videos")[0],
-        fps=24,
-        output_path=str(out_path),
-        audio=state.get("audio")[0],
-        audio_sample_rate=state.get("sampling_rate"),
-    )
+    elapsed = _run_generation(task, kwargs, turbo, turbo_strength, out_path)
 
     size_txt = "×".join(map(str, SIZES[size])) if SIZES[size] else "auto"
     ref_txt = f" · {len(refs)} refs" if task == "ref2va" else ""
@@ -205,6 +233,180 @@ def generate(
         f"{size_txt} · {int(steps)} steps · generated in {elapsed / 60:.1f} min"
     )
     return str(out_path), info
+
+
+# --------------------------------------------------------------------------
+# REST API: POST /api/generate returns a job id; a single worker thread runs
+# jobs one at a time (sharing _gen_lock with the UI). Jobs live in memory;
+# finished videos persist under outputs/api/.
+# --------------------------------------------------------------------------
+
+API_OUTPUT_DIR = Path(__file__).parent / "outputs" / "api"
+MAX_JOBS_KEPT = 200
+
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+_job_queue: queue.Queue = queue.Queue()
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, description="Prompt, ideally shot-by-shot with a soundscape")
+    image_b64: str | None = Field(None, description="First frame, base64 (raw or data URL)")
+    image_url: str | None = Field(None, description="First frame, fetched from URL")
+    last_image_b64: str | None = None
+    last_image_url: str | None = None
+    width: int | None = Field(None, description="Canvas width, multiple of 32 (omit both for model default)")
+    height: int | None = None
+    seconds: float = Field(8.0, ge=5.2, le=14.4)
+    steps: int | None = Field(None, ge=4, le=60, description="Defaults to 50, or 5 with turbo")
+    seed: int = Field(-1, description="-1 = random")
+    turbo: bool = False
+    turbo_strength: float = Field(1.0, ge=0.5, le=1.5)
+
+
+def _load_image(b64: str | None, url: str | None):
+    from PIL import Image
+
+    if b64:
+        if b64.startswith("data:") and "," in b64:
+            b64 = b64.split(",", 1)[1]
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    if url:
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=60) as r:
+            return Image.open(io.BytesIO(r.read())).convert("RGB")
+    return None
+
+
+def _job_public(job: dict) -> dict:
+    out = {k: job[k] for k in ("job_id", "status", "created", "params") if k in job}
+    for k in ("info", "error", "elapsed_seconds", "seed"):
+        if job.get(k) is not None:
+            out[k] = job[k]
+    if job.get("status") == "done":
+        out["video_url"] = f"/api/jobs/{job['job_id']}/video"
+    if job.get("status") == "queued":
+        with _jobs_lock:
+            queued = [j for j in _jobs.values() if j["status"] == "queued"]
+        queued.sort(key=lambda j: j["created"])
+        out["queue_position"] = next(
+            (i for i, j in enumerate(queued) if j["job_id"] == job["job_id"]), 0
+        )
+    return out
+
+
+def _api_worker():
+    import torch
+
+    while True:
+        job_id = _job_queue.get()
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job is None or job["status"] != "queued":
+                continue
+            job["status"] = "running"
+        try:
+            req: GenerateRequest = job["request"]
+            seed = req.seed if req.seed >= 0 else int(torch.seed() % 2**31)
+            num_frames = _snap_frames(req.seconds)
+            steps = req.steps if req.steps is not None else (5 if req.turbo else 50)
+
+            kwargs = {
+                "prompt": req.prompt.strip(),
+                "num_frames": num_frames,
+                "num_inference_steps": steps,
+                "generator": torch.Generator().manual_seed(seed),
+            }
+            if req.width and req.height:
+                kwargs["width"], kwargs["height"] = req.width, req.height
+            image = _load_image(req.image_b64, req.image_url)
+            if image is not None:
+                kwargs["image"] = image
+            last = _load_image(req.last_image_b64, req.last_image_url)
+            if last is not None:
+                kwargs["last_image"] = last
+
+            out_path = API_OUTPUT_DIR / f"{job_id}.mp4"
+            elapsed = _run_generation("fl2va", kwargs, req.turbo, req.turbo_strength, out_path)
+
+            size_txt = f"{req.width}×{req.height}" if req.width and req.height else "auto"
+            turbo_txt = f" · turbo@{req.turbo_strength:g}" if req.turbo else ""
+            with _jobs_lock:
+                job.update(
+                    status="done",
+                    seed=seed,
+                    elapsed_seconds=round(elapsed, 1),
+                    video_path=str(out_path),
+                    info=(
+                        f"fl2va{turbo_txt} · seed {seed} · {num_frames} frames "
+                        f"({num_frames / 24:.1f}s) · {size_txt} · {steps} steps · "
+                        f"generated in {elapsed / 60:.1f} min"
+                    ),
+                )
+        except Exception:
+            with _jobs_lock:
+                job.update(status="error", error=traceback.format_exc(limit=8))
+
+
+threading.Thread(target=_api_worker, daemon=True, name="api-worker").start()
+
+api = FastAPI(title="MiniMax-H3 API", docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+
+@api.post("/api/generate")
+def api_generate(req: GenerateRequest):
+    if (req.width is None) != (req.height is None):
+        raise HTTPException(422, "Provide both width and height, or neither.")
+    if req.width and (req.width % 32 or req.height % 32):
+        raise HTTPException(422, "width and height must be multiples of 32.")
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created": time.time(),
+        "request": req,
+        "params": req.model_dump(exclude={"image_b64", "last_image_b64"}, exclude_none=True),
+    }
+    with _jobs_lock:
+        _jobs[job_id] = job
+        # Drop oldest finished jobs beyond the cap (their mp4s stay on disk).
+        if len(_jobs) > MAX_JOBS_KEPT:
+            for jid in sorted(_jobs, key=lambda j: _jobs[j]["created"]):
+                if len(_jobs) <= MAX_JOBS_KEPT:
+                    break
+                if _jobs[jid]["status"] in ("done", "error"):
+                    del _jobs[jid]
+    _job_queue.put(job_id)
+    return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
+
+
+@api.get("/api/jobs")
+def api_jobs():
+    with _jobs_lock:
+        jobs = sorted(_jobs.values(), key=lambda j: j["created"], reverse=True)
+    return [_job_public(j) for j in jobs[:50]]
+
+
+@api.get("/api/jobs/{job_id}")
+def api_job(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown job id.")
+    return _job_public(job)
+
+
+@api.get("/api/jobs/{job_id}/video")
+def api_job_video(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown job id.")
+    if job["status"] != "done":
+        raise HTTPException(409, f"Job is {job['status']}, not done.")
+    return FileResponse(job["video_path"], media_type="video/mp4", filename=f"h3_{job_id}.mp4")
 
 
 with gr.Blocks(title="MiniMax-H3") as demo:
@@ -325,4 +527,8 @@ with gr.Blocks(title="MiniMax-H3") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", server_port=7860)
+    import uvicorn
+
+    demo.queue(default_concurrency_limit=1)
+    app = gr.mount_gradio_app(api, demo, path="/")
+    uvicorn.run(app, host="0.0.0.0", port=7860)
