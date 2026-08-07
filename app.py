@@ -4,11 +4,13 @@
 Serves Gradio on 0.0.0.0:7860 so it is reachable from other machines on the
 network. The pipeline loads lazily on the first generation (~30s) and stays
 resident afterwards; requests are serialized through the queue since the model
-saturates the GPU.
+saturates the GPU. Switching between FL2VA and Ref2VA reloads the transformer
+partition (~62GB) once.
 
 Run:  .venv/bin/python app.py
 """
 
+import gc
 import os
 import threading
 import time
@@ -18,7 +20,7 @@ os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 
 import gradio as gr
 
-from generate import build_pipeline
+from generate import build_pipeline, build_references
 
 OUTPUT_DIR = Path(__file__).parent / "outputs" / "gradio"
 
@@ -33,7 +35,11 @@ SIZES = {
     "Auto (model default for input image)": None,
 }
 
+MODE_FL2VA = "Text / first-last frame (FL2VA)"
+MODE_REF2VA = "Reference images/video/audio (Ref2VA)"
+
 _pipe = None
+_pipe_task = None
 _pipe_lock = threading.Lock()
 
 
@@ -49,12 +55,24 @@ def _check_gpu_free() -> None:
         )
 
 
-def _get_pipe():
-    global _pipe
+def _get_pipe(task: str):
+    """Return the pipeline for `task`, swapping transformers if the mode changed."""
+    global _pipe, _pipe_task
+    import torch
+
     with _pipe_lock:
+        if _pipe is not None and _pipe_task != task:
+            # Different transformer partition; drop the resident one so the
+            # next load fits in host RAM / VRAM.
+            del _pipe
+            _pipe = None
+            _pipe_task = None
+            gc.collect()
+            torch.cuda.empty_cache()
         if _pipe is None:
             _check_gpu_free()
-            _pipe = build_pipeline(bf16_text_encoder=False)
+            _pipe = build_pipeline(bf16_text_encoder=False, task=task)
+            _pipe_task = task
     return _pipe
 
 
@@ -64,20 +82,75 @@ def _snap_frames(seconds: float) -> int:
     return 17 * max(n, 7) + 5
 
 
-def generate(prompt, image, last_image, size, seconds, steps, seed, progress=gr.Progress()):
+def _mode_visibility(mode):
+    is_ref = mode == MODE_REF2VA
+    return (
+        gr.update(visible=not is_ref),  # fl2va_row
+        gr.update(visible=is_ref),  # ref_images
+        gr.update(visible=is_ref),  # ref_videos
+        gr.update(visible=is_ref),  # ref_audios
+        gr.update(visible=is_ref),  # ref_help
+    )
+
+
+def generate(
+    mode,
+    prompt,
+    image,
+    last_image,
+    ref_images,
+    ref_videos,
+    ref_audios,
+    size,
+    seconds,
+    steps,
+    seed,
+    progress=gr.Progress(),
+):
     import torch
     from diffusers.utils.export_utils import encode_video
 
     if not prompt or not prompt.strip():
         raise gr.Error("A prompt is required.")
 
+    task = "ref2va" if mode == MODE_REF2VA else "fl2va"
     num_frames = _snap_frames(seconds)
     seed = int(seed)
     if seed < 0:
         seed = int(torch.seed() % 2**31)
 
-    progress(0, desc="Loading pipeline (first run takes ~30s)")
-    pipe = _get_pipe()
+    refs = []
+    if task == "ref2va":
+        # Order: gallery images (upload order), then videos, then audios.
+        # Matches the usual "subject first, then motion/voice" pattern.
+        for item in ref_images or []:
+            # Gallery may yield a path str, (path, caption) tuple, or a dict.
+            if isinstance(item, (list, tuple)):
+                path = item[0]
+            elif isinstance(item, dict):
+                path = item.get("name") or item.get("path") or item.get("image")
+            else:
+                path = item
+            if path:
+                refs.append(("image", str(path)))
+        for path in ref_videos or []:
+            if path:
+                refs.append(("video", str(path)))
+        for path in ref_audios or []:
+            if path:
+                refs.append(("audio", str(path)))
+        if not refs:
+            raise gr.Error("Ref2VA needs at least one reference image, video, or audio.")
+        if all(kind == "audio" for kind, _ in refs):
+            raise gr.Error("Audio references cannot be the only inputs — add an image or video.")
+        n_img = sum(1 for k, _ in refs if k == "image")
+        n_vid = sum(1 for k, _ in refs if k == "video")
+        n_aud = sum(1 for k, _ in refs if k == "audio")
+        if n_img > 9 or n_vid > 3 or n_aud > 3 or len(refs) > 12:
+            raise gr.Error("Limits: ≤9 images, ≤3 videos, ≤3 audios, ≤12 total.")
+
+    progress(0, desc=f"Loading {task} pipeline (first run / mode switch takes a bit)")
+    pipe = _get_pipe(task)
 
     kwargs = {
         "prompt": prompt.strip(),
@@ -87,10 +160,14 @@ def generate(prompt, image, last_image, size, seconds, steps, seed, progress=gr.
     }
     if SIZES[size] is not None:
         kwargs["width"], kwargs["height"] = SIZES[size]
-    if image is not None:
-        kwargs["image"] = image
-    if last_image is not None:
-        kwargs["last_image"] = last_image
+
+    if task == "ref2va":
+        kwargs["references"] = build_references(refs)
+    else:
+        if image is not None:
+            kwargs["image"] = image
+        if last_image is not None:
+            kwargs["last_image"] = last_image
 
     progress(0.05, desc=f"Generating {num_frames / 24:.1f}s of video (takes minutes)")
     t0 = time.time()
@@ -98,7 +175,7 @@ def generate(prompt, image, last_image, size, seconds, steps, seed, progress=gr.
     elapsed = time.time() - t0
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"h3_{time.strftime('%Y%m%d_%H%M%S')}_seed{seed}.mp4"
+    out_path = OUTPUT_DIR / f"h3_{task}_{time.strftime('%Y%m%d_%H%M%S')}_seed{seed}.mp4"
     progress(0.95, desc="Encoding mp4")
     encode_video(
         state.get("videos")[0],
@@ -109,8 +186,9 @@ def generate(prompt, image, last_image, size, seconds, steps, seed, progress=gr.
     )
 
     size_txt = "×".join(map(str, SIZES[size])) if SIZES[size] else "auto"
+    ref_txt = f" · {len(refs)} refs" if task == "ref2va" else ""
     info = (
-        f"seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
+        f"{task}{ref_txt} · seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
         f"{size_txt} · {int(steps)} steps · generated in {elapsed / 60:.1f} min"
     )
     return str(out_path), info
@@ -122,7 +200,13 @@ with gr.Blocks(title="MiniMax-H3") as demo:
         "Joint video and stereo-audio generation, 24fps, 5–14.4s. "
         "Detailed shot-by-shot prompts with a soundscape description work best "
         "([prompting guide](https://huggingface.co/MiniMaxAI/MiniMax-H3)). "
-        "Generation takes several minutes."
+        "Generation takes several minutes. Switching FL2VA ↔ Ref2VA reloads the "
+        "transformer partition."
+    )
+    mode = gr.Radio(
+        [MODE_FL2VA, MODE_REF2VA],
+        value=MODE_FL2VA,
+        label="Mode",
     )
     with gr.Row():
         with gr.Column(scale=3):
@@ -136,9 +220,38 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                     "non_diegetic_music: playful pizzicato strings..."
                 ),
             )
-            with gr.Row():
+            with gr.Row(visible=True) as fl2va_row:
                 image = gr.Image(label="First frame (optional)", type="pil")
                 last_image = gr.Image(label="Last frame (optional)", type="pil")
+            ref_images = gr.Gallery(
+                label="Reference images (≤9, order = <Picture 1>…)",
+                type="filepath",
+                columns=3,
+                height=200,
+                visible=False,
+            )
+            ref_videos = gr.File(
+                label="Reference videos (≤3, optional)",
+                file_count="multiple",
+                file_types=["video"],
+                type="filepath",
+                visible=False,
+            )
+            ref_audios = gr.File(
+                label="Reference audio (≤3, optional; cannot be sole input)",
+                file_count="multiple",
+                file_types=["audio"],
+                type="filepath",
+                visible=False,
+            )
+            ref_help = gr.Markdown(
+                "Name each reference in the prompt (`<Picture 1>` is the sofa, "
+                "`<Picture 2>` is the room…). Order: images → videos → audios. "
+                "See the [ref prompt guide]"
+                "(https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/"
+                "VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).",
+                visible=False,
+            )
             with gr.Row():
                 size = gr.Dropdown(list(SIZES), value="960×544 landscape (fast)", label="Canvas")
                 seconds = gr.Slider(5.2, 14.4, value=8.0, step=0.1, label="Duration (seconds)")
@@ -150,7 +263,28 @@ with gr.Blocks(title="MiniMax-H3") as demo:
             video = gr.Video(label="Result", autoplay=True)
             info = gr.Textbox(label="Run info", interactive=False)
 
-    btn.click(generate, [prompt, image, last_image, size, seconds, steps, seed], [video, info])
+    mode.change(
+        _mode_visibility,
+        [mode],
+        [fl2va_row, ref_images, ref_videos, ref_audios, ref_help],
+    )
+    btn.click(
+        generate,
+        [
+            mode,
+            prompt,
+            image,
+            last_image,
+            ref_images,
+            ref_videos,
+            ref_audios,
+            size,
+            seconds,
+            steps,
+            seed,
+        ],
+        [video, info],
+    )
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", server_port=7860)

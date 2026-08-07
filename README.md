@@ -4,15 +4,15 @@ Local video + stereo audio generation with [MiniMax-H3](https://huggingface.co/M
 MiniMax's omni-modal model (open weights released 2026-08-03). It jointly denoises video and
 32kHz stereo audio in one transformer pass: 24fps, 5–15 seconds, 768px short edge.
 
-This repo runs the **H3-Base FL2VA** checkpoint via the official
+This repo runs the official
 [diffusers integration](https://github.com/huggingface/diffusers/pull/14355)
 (Modular Diffusers blocks), covering:
 
-- **t2va** — text to video+audio
-- **fl2va** — first-frame and/or last-frame conditioned video+audio
+- **t2va** — text to video+audio (`transformer/`)
+- **fl2va** — first-frame and/or last-frame conditioned video+audio (`transformer/`)
+- **ref2va** — omni-reference images/videos/audio (`transformer_ref/`, extra ~62GB)
 
-Not set up here (yet): **ref2va** (omni-reference, `transformer_ref/` subfolder, extra ~62GB) and the
-hosted **H3-Context-IR** / **H3-Regenerate-2K** API stages used for full 2K output.
+Not set up here: the hosted **H3-Context-IR** / **H3-Regenerate-2K** API stages used for full 2K output.
 
 ## Hardware fit (this machine)
 
@@ -31,10 +31,10 @@ Single RTX PRO 6000 Blackwell 96GB, 125GB host RAM.
 uv venv --python 3.12
 uv pip install -r requirements.txt --torch-backend=auto
 
-# Weights (~130GB, diffusers layout only; skips the original FL2VA/Ref2VA checkpoints):
+# Weights (diffusers layout only; skips the original FL2VA/Ref2VA folders):
 export HF_HOME=~/.cache/hf
 hf download MiniMaxAI/MiniMax-H3 --include 'modular_model_index.json' 'transformer/*' \
-  'text_encoder/*' 'tokenizer/*' 'processor/*' 'vae/*' 'audio_vae/*' \
+  'transformer_ref/*' 'text_encoder/*' 'tokenizer/*' 'processor/*' 'vae/*' 'audio_vae/*' \
   'scheduler/*' 'audio_scheduler/*'
 ```
 
@@ -48,8 +48,9 @@ hf download MiniMaxAI/MiniMax-H3 --include 'modular_model_index.json' 'transform
 ```
 
 Serves Gradio on `http://0.0.0.0:7860` (LAN-reachable, no auth — don't expose past the LAN).
-The model loads lazily on the first generation (~30s) and stays resident; requests queue up
-one at a time. Outputs are saved to `outputs/gradio/`.
+Pick **FL2VA** (text / first-last frame) or **Ref2VA** (reference images/video/audio). The matching
+transformer partition loads lazily on first use; switching modes reloads ~62GB of weights.
+Requests queue one at a time. Outputs land in `outputs/gradio/`.
 
 ## CLI usage
 
@@ -62,6 +63,14 @@ python generate.py 'A red fox trotting through a snowy pine forest, snow crunchi
 # First-frame conditioned (canvas follows the image's aspect ratio)
 python generate.py 'The astronaut waves at the camera' --image astronaut.jpg
 
+# Omni-reference (subject / product identity). Order is semantic — name each ref in the prompt.
+python generate.py 'Use <Picture 1> as the product; slow orbit around it in a bright showroom' \
+  --ref image:sofa_front.jpg --ref image:sofa_side.jpg
+
+# Mixed refs: image + motion video + voice
+python generate.py 'The character from <Picture 1> walks as in <Video 1>, speaking with <Audio 1>' \
+  --ref image:subject.jpg --ref video:walk.mp4 --ref audio:line.wav
+
 # Smaller canvas ≈ 2.3x faster per step than the default 1344x768
 python generate.py 'Ocean waves at sunset' --width 960 --height 544 --num-frames 124
 ```
@@ -73,9 +82,11 @@ Constraints to keep in mind:
 - `--num-frames` snaps up to the next `17*n + 5`; duration must stay within 5–15s at 24fps.
 - `--height`/`--width` must be multiples of 32; short edge is designed for 768.
 - The checkpoint is CFG-distilled: no negative prompt, no guidance scale.
+- Ref2VA limits: ≤9 images, ≤3 videos, ≤3 audios, ≤12 total; audio cannot be the sole input.
+- `--ref` cannot be combined with `--image` / `--last-image` (different transformer partitions).
 - Prompt quality matters a lot — the hosted pipeline uses a rewriting stage (H3-Context-IR).
-  See the [prompting guide](https://huggingface.co/MiniMaxAI/MiniMax-H3) on the model card;
-  detailed, shot-by-shot descriptions with an `overall_soundscape` section work best.
+  See the [prompting guide](https://huggingface.co/MiniMaxAI/MiniMax-H3) and the
+  [ref prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
 
 ## License
 

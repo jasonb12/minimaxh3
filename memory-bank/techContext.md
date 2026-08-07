@@ -20,6 +20,7 @@
 
 - `~/.cache/huggingface` is **root-owned** on this machine and sudo needs a password, so
   `HF_HOME=~/.cache/hf` is used instead. `generate.py` sets this default itself.
-- Weights live in `~/.cache/hf/hub/models--MiniMaxAI--MiniMax-H3` (~130GB, diffusers layout only).
+- Weights live in `~/.cache/hf/hub/models--MiniMaxAI--MiniMax-H3` (FL2VA ~150GB +
+  `transformer_ref/` ~62GB for Ref2VA; diffusers layout only).
 - `hf` CLI and `uv` are installed globally at `~/.local/bin`.
 - No ffmpeg on PATH; mp4 muxing goes through PyAV, which is fine.

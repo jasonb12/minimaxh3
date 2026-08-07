@@ -8,9 +8,12 @@ through MiniMax's paid API. The GPU normally serves a Qwen LLM via vLLM; H3 is u
 ## How it should work
 
 - `python generate.py '<prompt>' [--image first.jpg] [--last-image last.jpg]` produces a
-  768p-class mp4 (4–15s, 24fps) with native stereo audio in `outputs/`.
+  768p-class mp4 (5–15s, 24fps) with native stereo audio in `outputs/` (t2va / fl2va).
+- `python generate.py '<prompt>' --ref image:sofa.jpg` (repeatable `--ref KIND:PATH`) runs
+  Ref2VA for subject/product consistency (furniture, characters, style, etc.).
 - Generation quality depends heavily on prompt detail; the model card's prompting guide
   (shot-by-shot description + `overall_soundscape` + `non_diegetic_music`) is the reference.
+  Ref2VA prompts should name each reference (`<Picture 1>`, …).
 
 ## Model overview
 

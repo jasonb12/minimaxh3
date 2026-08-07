@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Generate video + stereo audio with MiniMax-H3 (text-to-video or first/last-frame conditioning).
+"""Generate video + stereo audio with MiniMax-H3.
+
+Supports:
+  - t2va / fl2va — text, and optional first/last keyframes (transformer/)
+  - ref2va — ordered image/video/audio references (transformer_ref/)
 
 Examples:
     # Text to video+audio (defaults: 16:9 canvas, ~5s)
@@ -7,6 +11,10 @@ Examples:
 
     # First-frame conditioned
     python generate.py 'The astronaut waves at the camera' --image astronaut.jpg
+
+    # Omni-reference (furniture / subject identity). Order is semantic.
+    python generate.py 'Use <Picture 1> as the product; orbit slowly around it' \\
+        --ref image:sofa_front.jpg --ref image:sofa_side.jpg
 
     # Faster smoke test on a smaller canvas
     python generate.py 'Ocean waves at sunset' --width 960 --height 544 --num-frames 124
@@ -23,13 +31,36 @@ from pathlib import Path
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3"
+REF_KINDS = ("image", "video", "audio")
+
+
+def _parse_ref(value: str) -> tuple[str, str]:
+    """Parse `kind:path` (kind = image|video|audio). Bare paths default to image."""
+    if ":" in value:
+        kind, path = value.split(":", 1)
+        kind = kind.lower().strip()
+        if kind in REF_KINDS and path:
+            return kind, path
+    # Allow Windows-style absolute paths and bare image paths without a kind.
+    return "image", value
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MiniMax-H3 video+audio generation")
     p.add_argument("prompt", help="Text prompt (see prompting guide on the model card)")
-    p.add_argument("--image", help="Optional first-frame image (path or URL)")
-    p.add_argument("--last-image", help="Optional last-frame image (path or URL)")
+    p.add_argument("--image", help="Optional first-frame image (path or URL); fl2va")
+    p.add_argument("--last-image", help="Optional last-frame image (path or URL); fl2va")
+    p.add_argument(
+        "--ref",
+        action="append",
+        default=[],
+        metavar="KIND:PATH",
+        help=(
+            "Omni-reference for ref2va. Repeatable; order is semantic. "
+            "KIND is image|video|audio (default image if omitted), e.g. "
+            "--ref image:chair.jpg --ref video:orbit.mp4 --ref audio:voice.wav"
+        ),
+    )
     p.add_argument("--height", type=int, help="Canvas height, multiple of 32 (default: model's 16:9 canvas)")
     p.add_argument("--width", type=int, help="Canvas width, multiple of 32")
     p.add_argument("--num-frames", type=int, help="Frame count; snapped up to 17*n+5, 24 fps, 5-15s")
@@ -42,15 +73,33 @@ def parse_args() -> argparse.Namespace:
         help="Load the Qwen3-VL conditioner in bf16 (~62GB) instead of int8 (~32GB). "
         "Needs more free host RAM during loading.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    args.refs = [_parse_ref(r) for r in args.ref]
+    if args.refs and (args.image or args.last_image):
+        p.error("--ref (ref2va) cannot be combined with --image/--last-image (fl2va)")
+    return args
 
 
-def build_pipeline(bf16_text_encoder: bool):
+def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
+    """Build the FL2VA (`t2va`/`fl2va`) or Ref2VA (`ref2va`) modular pipeline.
+
+    The two tasks load different transformer partitions from the same repo
+    (`transformer/` vs `transformer_ref/`); shared components (VAE, conditioner,
+    schedulers) are the same.
+    """
     import torch
     from diffusers import ComponentsManager, ModularPipeline
 
+    if task not in ("fl2va", "ref2va"):
+        raise ValueError(f"Unknown task {task!r}; expected 'fl2va' or 'ref2va'")
+
     manager = ComponentsManager()
-    pipe = ModularPipeline.from_pretrained(MODEL_ID, components_manager=manager)
+    if task == "ref2va":
+        from diffusers.modular_pipelines import MiniMaxH3Ref2VABlocks
+
+        pipe = MiniMaxH3Ref2VABlocks().init_pipeline(MODEL_ID, components_manager=manager)
+    else:
+        pipe = ModularPipeline.from_pretrained(MODEL_ID, components_manager=manager)
 
     if not bf16_text_encoder:
         # Official int8 recipe for the conditioner: halves its footprint with
@@ -78,13 +127,32 @@ def build_pipeline(bf16_text_encoder: bool):
         )
 
     pipe.load_components(dtype=torch.bfloat16)
-    pipe.transformer.requires_grad_(False)
+    # Ref2VA exposes the denoise weights as `transformer_ref`; FL2VA as `transformer`.
+    denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
+    denoiser.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
 
     # 96GB card: transformer (61.7GB bf16) and conditioner cannot both stay
     # resident; the manager swaps them between GPU and host RAM on demand.
     manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin="12GB")
     return pipe
+
+
+def build_references(refs: list[tuple[str, str]]):
+    """Turn `(kind, path)` pairs into `MiniMaxH3Reference` instances (order preserved)."""
+    from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
+
+    out = []
+    for kind, path in refs:
+        if kind == "image":
+            out.append(MiniMaxH3Reference(image=path))
+        elif kind == "video":
+            out.append(MiniMaxH3Reference(video=path))
+        elif kind == "audio":
+            out.append(MiniMaxH3Reference(audio=path))
+        else:
+            raise ValueError(f"Unknown reference kind {kind!r}")
+    return out
 
 
 def main() -> None:
@@ -94,18 +162,22 @@ def main() -> None:
     from diffusers.utils import load_image
     from diffusers.utils.export_utils import encode_video
 
+    task = "ref2va" if args.refs else "fl2va"
     output = args.output or f"outputs/h3_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     Path(output).parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
-    pipe = build_pipeline(args.bf16_text_encoder)
-    print(f"[+] Pipeline loaded in {time.time() - t0:.0f}s", flush=True)
+    pipe = build_pipeline(args.bf16_text_encoder, task=task)
+    print(f"[+] Pipeline loaded ({task}) in {time.time() - t0:.0f}s", flush=True)
 
     call_kwargs = {"prompt": args.prompt, "generator": torch.Generator().manual_seed(args.seed)}
-    if args.image:
-        call_kwargs["image"] = load_image(args.image)
-    if args.last_image:
-        call_kwargs["last_image"] = load_image(args.last_image)
+    if task == "ref2va":
+        call_kwargs["references"] = build_references(args.refs)
+    else:
+        if args.image:
+            call_kwargs["image"] = load_image(args.image)
+        if args.last_image:
+            call_kwargs["last_image"] = load_image(args.last_image)
     for key, value in (
         ("height", args.height),
         ("width", args.width),

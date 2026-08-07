@@ -2,27 +2,30 @@
 
 ## Current focus
 
-Web UI added (2026-08-04). `app.py` serves Gradio on 0.0.0.0:7860 for remote use;
-verified end-to-end via the Gradio API (5.2s clip in 2.6 min including lazy model load).
-Running in the background via nohup, log at /tmp/h3_gradio.log. Not a systemd service
-(deliberately — it would fight vllm.service for the GPU on boot).
+Ref2VA wired up (2026-08-04). `generate.py` and `app.py` support both FL2VA
+(`transformer/`) and Ref2VA (`transformer_ref/` via `MiniMaxH3Ref2VABlocks`).
+CLI: `--ref image:path` (repeatable, order semantic). Gradio: mode radio that
+swaps the resident transformer partition on demand.
 
-Bring-up completed 2026-08-03: first verified clip `outputs/smoke_test.mp4`
-(960x544, 5.2s, stereo audio) generated in ~4 min + 21s pipeline load.
+`transformer_ref/*` download was started to `HF_HOME=~/.cache/hf` (~62GB); check
+`/tmp/h3_transformer_ref_download.log` until complete before the first Ref2VA run.
+
+Web UI (FL2VA) was already verified end-to-end earlier the same day. Gradio runs
+via nohup, log at `/tmp/h3_gradio.log`. Restart after the Ref2VA code change.
 
 ## Recent changes
 
+- Added Ref2VA path: `build_pipeline(..., task="ref2va")`, `--ref KIND:PATH`,
+  Gradio mode + gallery/video/audio inputs.
 - Stopped `vllm.service` to free the GPU. **Still stopped** — restart with
   `systemctl --user start vllm.service` when H3 isn't needed.
-- Downloaded ~150GB of weights to `~/.cache/hf` (took ~4h over WiFi at 7-12 MB/s).
-- Fixed missing `torchvision` (Qwen3VL video processor requires it; without it the
-  processor component fails to load and the text encoder step crashes with
-  `'NoneType' object has no attribute 'create_mm_token_type_ids'`).
+- Downloaded ~150GB of FL2VA-side weights to `~/.cache/hf`.
+- Fixed missing `torchvision` (Qwen3VL video processor requires it).
 
 ## Next steps
 
-Possible follow-ups, none started:
-1. Default-canvas (1344x768) and fl2va (image-conditioned) runs.
-2. ref2va support: download `transformer_ref/*` (~62GB), script path via `MiniMaxH3Ref2VABlocks`.
+1. Finish `transformer_ref/*` download; smoke-test a single-image Ref2VA run
+   (furniture / product) at 960x544.
+2. Default-canvas (1344x768) and fl2va (image-conditioned) runs.
 3. Unpin diffusers once MiniMax-H3 lands in a release.
 4. Set HF_TOKEN for faster future downloads.

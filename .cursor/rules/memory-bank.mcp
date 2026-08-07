@@ -5,4 +5,7 @@
   generation, and remember the user's Qwen endpoint on port 8000 goes down when you do.
 - Always use `HF_HOME=~/.cache/hf` — the default HF cache is root-owned and sudo is interactive.
 - diffusers is pinned to a PR commit; MiniMax-H3 is not in a diffusers release yet.
+- FL2VA vs Ref2VA: different transformer partitions (`transformer/` vs `transformer_ref/`).
+  Build with `build_pipeline(..., task="ref2va")` / `--ref KIND:PATH`. Do not keep both
+  resident — host RAM cannot hold two 62GB transformers plus the conditioner.
 - User prefers single quotes for static CLI arguments.
