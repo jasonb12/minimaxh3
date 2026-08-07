@@ -64,8 +64,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, help="Canvas height, multiple of 32 (default: model's 16:9 canvas)")
     p.add_argument("--width", type=int, help="Canvas width, multiple of 32")
     p.add_argument("--num-frames", type=int, help="Frame count; snapped up to 17*n+5, 24 fps, 5-15s")
-    p.add_argument("--steps", type=int, help="num_inference_steps (default: pipeline default)")
+    p.add_argument("--steps", type=int, help="num_inference_steps (default: pipeline default; 5 with --turbo)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--turbo",
+        action="store_true",
+        help="Apply the community Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): "
+        "4 model evaluations instead of ~50, roughly 10x faster sampling. Preview quality — "
+        "sharp, but can show plastic skin / over-sharp grain. FL2VA only.",
+    )
+    p.add_argument(
+        "--turbo-strength",
+        type=float,
+        default=1.0,
+        help="Turbo LoRA scale. Nudge up (1.05-1.2) against blurry ghosting, "
+        "down (0.8-0.95) against over-sharp grain.",
+    )
     p.add_argument("--output", default=None, help="Output .mp4 path (default: outputs/<timestamp>.mp4)")
     p.add_argument(
         "--bf16-text-encoder",
@@ -77,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     args.refs = [_parse_ref(r) for r in args.ref]
     if args.refs and (args.image or args.last_image):
         p.error("--ref (ref2va) cannot be combined with --image/--last-image (fl2va)")
+    if args.turbo and args.refs:
+        p.error("--turbo is trained against the FL2VA transformer; not available with --ref")
     return args
 
 
@@ -169,6 +185,14 @@ def main() -> None:
     t0 = time.time()
     pipe = build_pipeline(args.bf16_text_encoder, task=task)
     print(f"[+] Pipeline loaded ({task}) in {time.time() - t0:.0f}s", flush=True)
+
+    if args.turbo:
+        from turbo import TURBO_NUM_INFERENCE_STEPS, load_turbo_lora
+
+        load_turbo_lora(pipe.transformer, strength=args.turbo_strength)
+        if args.steps is None:
+            args.steps = TURBO_NUM_INFERENCE_STEPS
+        print(f"[+] Turbo LoRA applied (strength {args.turbo_strength}, steps {args.steps})", flush=True)
 
     call_kwargs = {"prompt": args.prompt, "generator": torch.Generator().manual_seed(args.seed)}
     if task == "ref2va":

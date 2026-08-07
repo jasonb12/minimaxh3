@@ -1,6 +1,16 @@
 # Active Context
 
-## Current focus
+## Current focus (2026-08-07)
+
+Turbo LoRA integrated: community 4-step distillation LoRA
+(larryvrh/MiniMax-H3-Turbo-Lora) applied via `turbo.py` key remapping +
+PEFT adapter. Measured 248s -> 47s end-to-end at 960x544/5.2s. `--turbo` on
+the CLI, Turbo checkbox in the web UI (both verified end-to-end). FL2VA only.
+Full solution documented in docs/TURBO.md — read it before touching the
+remapping (the fc1 half-swap and the "no custom sampler needed" reasoning are
+non-obvious).
+
+## Previous focus
 
 Ref2VA wired up (2026-08-04). `generate.py` and `app.py` support both FL2VA
 (`transformer/`) and Ref2VA (`transformer_ref/` via `MiniMaxH3Ref2VABlocks`).

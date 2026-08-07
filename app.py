@@ -105,6 +105,8 @@ def generate(
     seconds,
     steps,
     seed,
+    turbo,
+    turbo_strength,
     progress=gr.Progress(),
 ):
     import torch
@@ -149,8 +151,18 @@ def generate(
         if n_img > 9 or n_vid > 3 or n_aud > 3 or len(refs) > 12:
             raise gr.Error("Limits: ≤9 images, ≤3 videos, ≤3 audios, ≤12 total.")
 
+    if turbo and task == "ref2va":
+        raise gr.Error("Turbo is trained against the FL2VA transformer; switch mode or disable Turbo.")
+
     progress(0, desc=f"Loading {task} pipeline (first run / mode switch takes a bit)")
     pipe = _get_pipe(task)
+
+    if task == "fl2va":
+        from turbo import load_turbo_lora, set_turbo_enabled
+
+        if turbo:
+            load_turbo_lora(pipe.transformer, strength=float(turbo_strength))
+        set_turbo_enabled(pipe.transformer, turbo)
 
     kwargs = {
         "prompt": prompt.strip(),
@@ -187,8 +199,9 @@ def generate(
 
     size_txt = "×".join(map(str, SIZES[size])) if SIZES[size] else "auto"
     ref_txt = f" · {len(refs)} refs" if task == "ref2va" else ""
+    turbo_txt = f" · turbo@{float(turbo_strength):g}" if turbo and task == "fl2va" else ""
     info = (
-        f"{task}{ref_txt} · seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
+        f"{task}{ref_txt}{turbo_txt} · seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
         f"{size_txt} · {int(steps)} steps · generated in {elapsed / 60:.1f} min"
     )
     return str(out_path), info
@@ -256,8 +269,21 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 size = gr.Dropdown(list(SIZES), value="960×544 landscape (fast)", label="Canvas")
                 seconds = gr.Slider(5.2, 14.4, value=8.0, step=0.1, label="Duration (seconds)")
             with gr.Row():
-                steps = gr.Slider(10, 60, value=50, step=1, label="Steps")
+                steps = gr.Slider(4, 60, value=50, step=1, label="Steps")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+            with gr.Row():
+                turbo = gr.Checkbox(
+                    value=False,
+                    label="Turbo (4-step LoRA, ~10x faster; preview quality, FL2VA only)",
+                )
+                turbo_strength = gr.Slider(
+                    0.5,
+                    1.5,
+                    value=1.0,
+                    step=0.05,
+                    label="Turbo strength (up: fix ghosting · down: fix grain)",
+                    visible=False,
+                )
             btn = gr.Button("Generate", variant="primary")
         with gr.Column(scale=2):
             video = gr.Video(label="Result", autoplay=True)
@@ -268,6 +294,16 @@ with gr.Blocks(title="MiniMax-H3") as demo:
         [mode],
         [fl2va_row, ref_images, ref_videos, ref_audios, ref_help],
     )
+
+    def _toggle_turbo(enabled):
+        from turbo import TURBO_NUM_INFERENCE_STEPS
+
+        return (
+            gr.update(value=TURBO_NUM_INFERENCE_STEPS if enabled else 50),
+            gr.update(visible=enabled),
+        )
+
+    turbo.change(_toggle_turbo, [turbo], [steps, turbo_strength])
     btn.click(
         generate,
         [
@@ -282,6 +318,8 @@ with gr.Blocks(title="MiniMax-H3") as demo:
             seconds,
             steps,
             seed,
+            turbo,
+            turbo_strength,
         ],
         [video, info],
     )

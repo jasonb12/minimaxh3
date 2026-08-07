@@ -2,6 +2,10 @@
 
 ## Works
 
+- Turbo LoRA (docs/TURBO.md): 4-eval sampling via `--turbo` / web UI checkbox,
+  ~5.3x wall-clock speedup, verified on CLI and through the Gradio API.
+  Preview-quality caveats (plastic skin, grain) tunable via strength.
+
 - Gradio web UI (`app.py`) on port 7860: FL2VA (prompt + optional first/last
   frames) and Ref2VA (reference images/videos/audio), canvas presets,
   duration/steps/seed, queued single-slot generation, lazy pipeline load with a

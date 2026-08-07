@@ -77,6 +77,14 @@ python generate.py 'Ocean waves at sunset' --width 960 --height 544 --num-frames
 
 Output lands in `outputs/` as an mp4 with the soundtrack muxed in.
 
+## Turbo (~5x faster sampling)
+
+`--turbo` (CLI) or the Turbo checkbox (web UI) applies the community
+[4-step distillation LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora):
+4 model evaluations instead of ~49, measured 248s → 47s end-to-end at 960×544/5.2s.
+Preview quality (can show plastic skin / over-sharp grain); FL2VA only.
+See [docs/TURBO.md](docs/TURBO.md) for the key-remapping details and tuning.
+
 Constraints to keep in mind:
 
 - `--num-frames` snaps up to the next `17*n + 5`; duration must stay within 5–15s at 24fps.
