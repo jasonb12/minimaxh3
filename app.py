@@ -9,9 +9,11 @@ Serves on 0.0.0.0:7860, reachable from other machines on the network:
                  GET  /api/jobs/{id}/video -> the mp4
                  GET  /api/jobs            -> recent jobs
 
-The pipeline loads lazily on the first generation (~30s) and stays resident;
-UI and API requests share one GPU lock, so they serialize. Switching between
-FL2VA and Ref2VA reloads the transformer partition (~62GB) once.
+The pipeline loads lazily on the first generation and stays resident for later
+jobs of the same task. Discarding after every REST job dropped the Python
+handle without returning ~89GB of VRAM, so the next load saw 8GB free and
+refused. UI and API requests share one GPU lock, so they serialize. Switching
+FL2VA ↔ Ref2VA still reloads the transformer partition.
 
 Run:  .venv/bin/python app.py
 """
@@ -25,6 +27,7 @@ import threading
 import time
 import traceback
 import uuid
+from itertools import count
 from pathlib import Path
 
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
@@ -51,6 +54,10 @@ SIZES = {
 
 MODE_FL2VA = "Text / first-last frame (FL2VA)"
 MODE_REF2VA = "Reference images/video/audio (Ref2VA)"
+MAX_REF_IMAGES = 9
+MAX_REF_VIDEOS = 3
+MAX_REF_AUDIOS = 3
+MAX_REFS = 12
 
 _pipe = None
 _pipe_task = None
@@ -61,32 +68,137 @@ _pipe_lock = threading.Lock()
 _gen_lock = threading.Lock()
 
 
+def _foreign_vram_bytes() -> int:
+    """VRAM used by other processes. This process's leftover allocation is ours."""
+    import subprocess
+
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return 0
+
+    used = 0
+    my_pid = os.getpid()
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        pid_text, mem_text = (part.strip() for part in line.split(",", 1))
+        if int(pid_text) != my_pid:
+            used += int(mem_text) * 1024**2
+    return used
+
+
 def _check_gpu_free() -> None:
     import torch
 
-    free_bytes, _ = torch.cuda.mem_get_info()
-    if free_bytes < 70 * 1024**3:
+    total_bytes = torch.cuda.mem_get_info()[1]
+    foreign_bytes = _foreign_vram_bytes()
+    available_bytes = total_bytes - foreign_bytes
+    if available_bytes < 70 * 1024**3:
         raise gr.Error(
-            "GPU does not have enough free VRAM (needs ~70GB). "
-            "If the vLLM server is running, stop it first: "
-            "systemctl --user stop vllm.service"
+            f"GPU has only {available_bytes / 1024**3:.1f} GiB free of other "
+            "processes; loading MiniMax-H3 needs at least 70 GiB. If the vLLM "
+            "server is running, stop it first: systemctl --user stop vllm.service"
         )
+
+
+def _discard_pipe(pipe) -> None:
+    """Detach manager hooks without copying CUDA weights back into host RAM."""
+    global _pipe, _pipe_task
+
+    manager = getattr(pipe, "_components_manager", None)
+    hooks = list(getattr(manager, "model_hooks", None) or ())
+    for user_hook in hooks:
+        # Each offload hook references every other hook. Break those cycles
+        # before removing the hooks so dropping the pipe can free CUDA tensors.
+        user_hook.hook.other_hooks = None
+    for user_hook in hooks:
+        user_hook.remove()
+    if manager is not None:
+        manager.model_hooks = None
+        manager._auto_offload_enabled = False
+    if _pipe is pipe:
+        _pipe = None
+        _pipe_task = None
+
+
+def _clear_model_memory() -> None:
+    """Return released model allocations to CUDA and the operating system."""
+    import ctypes
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
+
+
+def _component_device(module):
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return None
+
+
+def _offload_other_components(pipe, keep) -> None:
+    """Move every managed module except `keep` off CUDA.
+
+    Diffusers only offloads siblings when the denoiser itself is coming onto
+    the GPU. After the first resident job the denoiser is already on CUDA, so
+    the ~32GB conditioner stays there and Ref2VA denoise OOMs (~93GB used,
+    6.5GB more requested).
+    """
+    import torch
+
+    manager = getattr(pipe, "_components_manager", None)
+    moved = False
+    for hook in getattr(manager, "model_hooks", None) or ():
+        if hook.model is keep:
+            continue
+        device = _component_device(hook.model)
+        if device is not None and device.type == "cuda":
+            hook.offload()
+            moved = True
+    if moved:
+        torch.cuda.empty_cache()
+
+
+def _install_exclusive_gpu_guard(pipe):
+    """Offload sibling components on every denoiser forward."""
+    denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
+    if getattr(denoiser, "_h3_exclusive_gpu", False):
+        return denoiser
+
+    original_forward = denoiser.forward
+
+    def forward(*args, **kwargs):
+        _offload_other_components(pipe, denoiser)
+        return original_forward(*args, **kwargs)
+
+    denoiser.forward = forward
+    denoiser._h3_exclusive_gpu = True
+    return denoiser
 
 
 def _get_pipe(task: str):
     """Return the pipeline for `task`, swapping transformers if the mode changed."""
     global _pipe, _pipe_task
-    import torch
 
     with _pipe_lock:
         if _pipe is not None and _pipe_task != task:
-            # Different transformer partition; drop the resident one so the
-            # next load fits in host RAM / VRAM.
-            del _pipe
-            _pipe = None
-            _pipe_task = None
-            gc.collect()
-            torch.cuda.empty_cache()
+            old_pipe = _pipe
+            _discard_pipe(old_pipe)
+            old_pipe = None
+            _clear_model_memory()
         if _pipe is None:
             _check_gpu_free()
             _pipe = build_pipeline(bf16_text_encoder=False, task=task)
@@ -105,13 +217,81 @@ def _mode_visibility(mode):
     return (
         gr.update(visible=not is_ref),  # fl2va_row
         gr.update(visible=is_ref),  # ref_images
+        gr.update(visible=is_ref),  # ref_image_count
         gr.update(visible=is_ref),  # ref_videos
         gr.update(visible=is_ref),  # ref_audios
         gr.update(visible=is_ref),  # ref_help
     )
 
 
-def _run_generation(task, kwargs, turbo, turbo_strength, out_path):
+def _reference_image_count(items):
+    count = len(items or [])
+    if count > MAX_REF_IMAGES:
+        return (
+            f"⚠️ **Graphic references: {count} / {MAX_REF_IMAGES} selected.** "
+            f"Remove {count - MAX_REF_IMAGES} before generating."
+        )
+    return (
+        f"**Graphic references: {count} / {MAX_REF_IMAGES} selected.** "
+        "Drop or select several images at once; upload order maps to "
+        "`<Picture 1>`, `<Picture 2>`, and so on."
+    )
+
+
+def _normalize_output_video(video, width=None, height=None, duration_seconds=None):
+    if width is None and height is None and duration_seconds is None:
+        return video
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+
+    if isinstance(video, list) and isinstance(video[0], Image.Image):
+        video = torch.from_numpy(np.stack([np.asarray(frame.convert("RGB")) for frame in video]))
+    elif isinstance(video, np.ndarray):
+        if np.issubdtype(video.dtype, np.floating) and np.all((video >= 0) & (video <= 1)):
+            video = (video * 255).round().astype("uint8")
+        video = torch.from_numpy(video)
+    if not isinstance(video, torch.Tensor):
+        raise TypeError(f"Cannot normalize video type {type(video)!r}")
+    video = video.to(dtype=torch.uint8, device="cpu")
+
+    target_width = int(width or video.shape[2])
+    target_height = int(height or video.shape[1])
+    if target_width != video.shape[2] or target_height != video.shape[1]:
+        resized = []
+        for chunk in torch.split(video, 8, dim=0):
+            rgb = chunk.permute(0, 3, 1, 2).float()
+            rgb = F.interpolate(
+                rgb,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+            resized.append(rgb.round().clamp(0, 255).byte().permute(0, 2, 3, 1))
+        video = torch.cat(resized, dim=0)
+
+    if duration_seconds is not None:
+        target_frames = max(1, round(float(duration_seconds) * 24))
+        if len(video) < target_frames:
+            video = torch.cat([video, video[-1:].repeat(target_frames - len(video), 1, 1, 1)], dim=0)
+        elif len(video) > target_frames:
+            video = video[:target_frames]
+    return video
+
+
+def _run_generation(
+    task,
+    kwargs,
+    turbo,
+    turbo_strength,
+    out_path,
+    include_audio=True,
+    output_width=None,
+    output_height=None,
+    output_duration_seconds=None,
+):
     """Toggle turbo, run the pipeline, and encode the mp4.
 
     Shared by the Gradio UI and the REST API; serialized on _gen_lock because
@@ -122,24 +302,31 @@ def _run_generation(task, kwargs, turbo, turbo_strength, out_path):
 
     with _gen_lock:
         pipe = _get_pipe(task)
-        if task == "fl2va":
-            from turbo import load_turbo_lora, set_turbo_enabled
+        from turbo import load_turbo_lora, set_turbo_enabled
 
-            if turbo:
-                load_turbo_lora(pipe.transformer, strength=float(turbo_strength))
-            set_turbo_enabled(pipe.transformer, turbo)
+        denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
+        if turbo:
+            load_turbo_lora(denoiser, strength=float(turbo_strength))
+        set_turbo_enabled(denoiser, turbo)
+        denoiser = _install_exclusive_gpu_guard(pipe)
 
         t0 = time.time()
         state = pipe(**kwargs)
         elapsed = time.time() - t0
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    encode_video(
+    video = _normalize_output_video(
         state.get("videos")[0],
+        output_width,
+        output_height,
+        output_duration_seconds,
+    )
+    encode_video(
+        video,
         fps=24,
         output_path=str(out_path),
-        audio=state.get("audio")[0],
-        audio_sample_rate=state.get("sampling_rate"),
+        audio=state.get("audio")[0] if include_audio else None,
+        audio_sample_rate=state.get("sampling_rate") if include_audio else None,
     )
     return elapsed
 
@@ -198,11 +385,16 @@ def generate(
         n_img = sum(1 for k, _ in refs if k == "image")
         n_vid = sum(1 for k, _ in refs if k == "video")
         n_aud = sum(1 for k, _ in refs if k == "audio")
-        if n_img > 9 or n_vid > 3 or n_aud > 3 or len(refs) > 12:
-            raise gr.Error("Limits: ≤9 images, ≤3 videos, ≤3 audios, ≤12 total.")
-
-    if turbo and task == "ref2va":
-        raise gr.Error("Turbo is trained against the FL2VA transformer; switch mode or disable Turbo.")
+        if (
+            n_img > MAX_REF_IMAGES
+            or n_vid > MAX_REF_VIDEOS
+            or n_aud > MAX_REF_AUDIOS
+            or len(refs) > MAX_REFS
+        ):
+            raise gr.Error(
+                f"Limits: ≤{MAX_REF_IMAGES} images, ≤{MAX_REF_VIDEOS} videos, "
+                f"≤{MAX_REF_AUDIOS} audios, ≤{MAX_REFS} total."
+            )
 
     kwargs = {
         "prompt": prompt.strip(),
@@ -227,7 +419,7 @@ def generate(
 
     size_txt = "×".join(map(str, SIZES[size])) if SIZES[size] else "auto"
     ref_txt = f" · {len(refs)} refs" if task == "ref2va" else ""
-    turbo_txt = f" · turbo@{float(turbo_strength):g}" if turbo and task == "fl2va" else ""
+    turbo_txt = f" · turbo@{float(turbo_strength):g}" if turbo else ""
     info = (
         f"{task}{ref_txt}{turbo_txt} · seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
         f"{size_txt} · {int(steps)} steps · generated in {elapsed / 60:.1f} min"
@@ -243,10 +435,13 @@ def generate(
 
 API_OUTPUT_DIR = Path(__file__).parent / "outputs" / "api"
 MAX_JOBS_KEPT = 200
+DEFAULT_PRIORITY = 100
+CLI_PRIORITY = 0
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
-_job_queue: queue.Queue = queue.Queue()
+_job_sequence = count()
+_job_queue: queue.PriorityQueue = queue.PriorityQueue()
 
 
 class GenerateRequest(BaseModel):
@@ -255,13 +450,39 @@ class GenerateRequest(BaseModel):
     image_url: str | None = Field(None, description="First frame, fetched from URL")
     last_image_b64: str | None = None
     last_image_url: str | None = None
+    reference_image_urls: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_REF_IMAGES,
+        description="Product/style identity references for Ref2VA; not output frames",
+    )
     width: int | None = Field(None, description="Canvas width, multiple of 32 (omit both for model default)")
     height: int | None = None
     seconds: float = Field(8.0, ge=5.2, le=14.4)
-    steps: int | None = Field(None, ge=4, le=60, description="Defaults to 50, or 5 with turbo")
+    num_frames: int | None = Field(
+        None,
+        ge=120,
+        le=360,
+        description="Optional frame count override; the pipeline rounds to its 17*n+5 grid.",
+    )
+    steps: int | None = Field(None, ge=4, le=60, description="Defaults to 5 with Turbo; 50 when Turbo is disabled")
     seed: int = Field(-1, description="-1 = random")
-    turbo: bool = False
-    turbo_strength: float = Field(1.0, ge=0.5, le=1.5)
+    turbo: bool = True
+    turbo_strength: float = Field(
+        0.85,
+        ge=0.5,
+        le=1.5,
+        description="Turbo LoRA strength; 0.85 favors cleaner commercial motion",
+    )
+    include_audio: bool = Field(True, description="Mux H3's generated stereo audio into the MP4")
+    output_width: int | None = Field(None, ge=2, description="Optional normalized output width")
+    output_height: int | None = Field(None, ge=2, description="Optional normalized output height")
+    output_duration_seconds: float | None = Field(None, gt=0, le=30)
+    priority: int = Field(
+        DEFAULT_PRIORITY,
+        ge=CLI_PRIORITY,
+        le=DEFAULT_PRIORITY,
+        description="Queue priority; lower runs first. Use 0 for an urgent CLI/test job.",
+    )
 
 
 def _load_image(b64: str | None, url: str | None):
@@ -289,7 +510,7 @@ def _job_public(job: dict) -> dict:
     if job.get("status") == "queued":
         with _jobs_lock:
             queued = [j for j in _jobs.values() if j["status"] == "queued"]
-        queued.sort(key=lambda j: j["created"])
+        queued.sort(key=lambda j: (j["priority"], j["sequence"]))
         out["queue_position"] = next(
             (i for i, j in enumerate(queued) if j["job_id"] == job["job_id"]), 0
         )
@@ -300,7 +521,7 @@ def _api_worker():
     import torch
 
     while True:
-        job_id = _job_queue.get()
+        _, _, job_id = _job_queue.get()
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job is None or job["status"] != "queued":
@@ -309,9 +530,10 @@ def _api_worker():
         try:
             req: GenerateRequest = job["request"]
             seed = req.seed if req.seed >= 0 else int(torch.seed() % 2**31)
-            num_frames = _snap_frames(req.seconds)
+            num_frames = req.num_frames if req.num_frames is not None else _snap_frames(req.seconds)
             steps = req.steps if req.steps is not None else (5 if req.turbo else 50)
 
+            task = "ref2va" if req.reference_image_urls else "fl2va"
             kwargs = {
                 "prompt": req.prompt.strip(),
                 "num_frames": num_frames,
@@ -320,18 +542,39 @@ def _api_worker():
             }
             if req.width and req.height:
                 kwargs["width"], kwargs["height"] = req.width, req.height
-            image = _load_image(req.image_b64, req.image_url)
-            if image is not None:
-                kwargs["image"] = image
-            last = _load_image(req.last_image_b64, req.last_image_url)
-            if last is not None:
-                kwargs["last_image"] = last
+            if task == "ref2va":
+                kwargs["references"] = build_references(
+                    [("image", url) for url in req.reference_image_urls]
+                )
+            else:
+                image = _load_image(req.image_b64, req.image_url)
+                if image is not None:
+                    kwargs["image"] = image
+                last = _load_image(req.last_image_b64, req.last_image_url)
+                if last is not None:
+                    kwargs["last_image"] = last
 
             out_path = API_OUTPUT_DIR / f"{job_id}.mp4"
-            elapsed = _run_generation("fl2va", kwargs, req.turbo, req.turbo_strength, out_path)
+            elapsed = _run_generation(
+                task,
+                kwargs,
+                req.turbo,
+                req.turbo_strength,
+                out_path,
+                include_audio=req.include_audio,
+                output_width=req.output_width,
+                output_height=req.output_height,
+                output_duration_seconds=req.output_duration_seconds,
+            )
 
             size_txt = f"{req.width}×{req.height}" if req.width and req.height else "auto"
+            output_txt = (
+                f" → {req.output_width}×{req.output_height}"
+                if req.output_width and req.output_height
+                else ""
+            )
             turbo_txt = f" · turbo@{req.turbo_strength:g}" if req.turbo else ""
+            audio_txt = "" if req.include_audio else " · silent"
             with _jobs_lock:
                 job.update(
                     status="done",
@@ -339,8 +582,8 @@ def _api_worker():
                     elapsed_seconds=round(elapsed, 1),
                     video_path=str(out_path),
                     info=(
-                        f"fl2va{turbo_txt} · seed {seed} · {num_frames} frames "
-                        f"({num_frames / 24:.1f}s) · {size_txt} · {steps} steps · "
+                        f"{task}{turbo_txt}{audio_txt} · seed {seed} · {num_frames} frames "
+                        f"({num_frames / 24:.1f}s) · {size_txt}{output_txt} · {steps} steps · "
                         f"generated in {elapsed / 60:.1f} min"
                     ),
                 )
@@ -360,14 +603,42 @@ def api_generate(req: GenerateRequest):
         raise HTTPException(422, "Provide both width and height, or neither.")
     if req.width and (req.width % 32 or req.height % 32):
         raise HTTPException(422, "width and height must be multiples of 32.")
+    if (req.output_width is None) != (req.output_height is None):
+        raise HTTPException(422, "Provide both output_width and output_height, or neither.")
+    if req.output_width and (req.output_width % 2 or req.output_height % 2):
+        raise HTTPException(422, "output_width and output_height must be even.")
+    has_keyframe = any(
+        (req.image_b64, req.image_url, req.last_image_b64, req.last_image_url)
+    )
+    if req.reference_image_urls and has_keyframe:
+        raise HTTPException(422, "Reference images cannot be combined with first/last-frame inputs.")
+    if any(not url.startswith(("http://", "https://")) for url in req.reference_image_urls):
+        raise HTTPException(422, "Reference images must be HTTP(S) URLs.")
 
     job_id = uuid.uuid4().hex[:12]
+    sequence = next(_job_sequence)
+    params = req.model_dump(
+        exclude={
+            "image_b64",
+            "image_url",
+            "last_image_b64",
+            "last_image_url",
+            "reference_image_urls",
+        },
+        exclude_none=True,
+    )
+    if has_keyframe:
+        params["has_keyframe"] = True
+    if req.reference_image_urls:
+        params["reference_image_count"] = len(req.reference_image_urls)
     job = {
         "job_id": job_id,
         "status": "queued",
         "created": time.time(),
+        "priority": req.priority,
+        "sequence": sequence,
         "request": req,
-        "params": req.model_dump(exclude={"image_b64", "last_image_b64"}, exclude_none=True),
+        "params": params,
     }
     with _jobs_lock:
         _jobs[job_id] = job
@@ -378,8 +649,12 @@ def api_generate(req: GenerateRequest):
                     break
                 if _jobs[jid]["status"] in ("done", "error"):
                     del _jobs[jid]
-    _job_queue.put(job_id)
-    return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
+    _job_queue.put((req.priority, sequence, job_id))
+    return {
+        "job_id": job_id,
+        "status_url": f"/api/jobs/{job_id}",
+        "priority": req.priority,
+    }
 
 
 @api.get("/api/jobs")
@@ -439,10 +714,14 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 image = gr.Image(label="First frame (optional)", type="pil")
                 last_image = gr.Image(label="Last frame (optional)", type="pil")
             ref_images = gr.Gallery(
-                label="Reference images (≤9, order = <Picture 1>…)",
+                label="Graphic references (up to 9 images)",
                 type="filepath",
                 columns=3,
                 height=200,
+                visible=False,
+            )
+            ref_image_count = gr.Markdown(
+                _reference_image_count(None),
                 visible=False,
             )
             ref_videos = gr.File(
@@ -471,20 +750,23 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 size = gr.Dropdown(list(SIZES), value="960×544 landscape (fast)", label="Canvas")
                 seconds = gr.Slider(5.2, 14.4, value=8.0, step=0.1, label="Duration (seconds)")
             with gr.Row():
-                steps = gr.Slider(4, 60, value=50, step=1, label="Steps")
+                steps = gr.Slider(4, 60, value=5, step=1, label="Steps")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
             with gr.Row():
                 turbo = gr.Checkbox(
-                    value=False,
-                    label="Turbo (4-step LoRA, ~10x faster; preview quality, FL2VA only)",
+                    value=True,
+                    label=(
+                        "Turbo (4-step LoRA, ~10x faster; preview quality; "
+                        "Ref2VA support is experimental and may reduce identity fidelity)"
+                    ),
                 )
                 turbo_strength = gr.Slider(
                     0.5,
                     1.5,
-                    value=1.0,
+                    value=0.85,
                     step=0.05,
                     label="Turbo strength (up: fix ghosting · down: fix grain)",
-                    visible=False,
+                    visible=True,
                 )
             btn = gr.Button("Generate", variant="primary")
         with gr.Column(scale=2):
@@ -494,8 +776,9 @@ with gr.Blocks(title="MiniMax-H3") as demo:
     mode.change(
         _mode_visibility,
         [mode],
-        [fl2va_row, ref_images, ref_videos, ref_audios, ref_help],
+        [fl2va_row, ref_images, ref_image_count, ref_videos, ref_audios, ref_help],
     )
+    ref_images.change(_reference_image_count, [ref_images], [ref_image_count])
 
     def _toggle_turbo(enabled):
         from turbo import TURBO_NUM_INFERENCE_STEPS
@@ -531,4 +814,8 @@ if __name__ == "__main__":
 
     demo.queue(default_concurrency_limit=1)
     app = gr.mount_gradio_app(api, demo, path="/")
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(
+        app,
+        host=os.environ.get("MINIMAX_H3_HOST", "0.0.0.0"),
+        port=int(os.environ.get("MINIMAX_H3_PORT", "7860")),
+    )

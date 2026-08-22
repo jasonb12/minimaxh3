@@ -14,8 +14,28 @@ Single-script CLI (`generate.py`) + Gradio UI (`app.py`) around diffusers Modula
 4. `load_components(dtype=torch.bfloat16)` fetches exactly the subfolders the blockset needs —
    never the other transformer partition, and never the original `FL2VA/`/`Ref2VA/` folders.
 5. `ComponentsManager.enable_auto_cpu_offload(memory_reserve_margin="12GB")` swaps the 61.7GB
-   transformer and ~32GB conditioner between GPU and host RAM per stage.
-6. Output state carries `videos`, `audio`, `sampling_rate`; `encode_video` muxes to mp4 via PyAV.
+   transformer and ~32GB conditioner between GPU and host RAM per stage. The
+   server keeps the loaded pipeline resident after each job. Discarding after
+   every REST job dropped the Python handle without returning ~89GB of VRAM,
+   so the next load's 70GB free-VRAM check failed against this process. Mode
+   switches still detach hooks without CPU-offloading the old partition. The
+   free-VRAM preflight counts only other processes. Each denoiser forward
+   offloads sibling components first so the conditioner cannot remain on CUDA
+   beside the 61.7GB transformer.
+6. Output state carries `videos`, `audio`, `sampling_rate`; `encode_video` writes
+   the MP4 via PyAV. REST callers may set `include_audio=false` to omit the audio
+   stream without changing H3's joint inference.
+7. REST `reference_image_urls` select Ref2VA and are decoded into
+   `MiniMaxH3Reference` objects. They are mutually exclusive with first/last
+   frames and are never echoed in job-status payloads. The FL2VA-trained Turbo
+   adapter can be loaded onto the structurally identical `transformer_ref`
+   modules as an experimental path; preserve the identity-fidelity warning.
+8. REST output normalization is post-generation and deterministic: bilinear
+   resize in bounded CPU chunks, then final-frame padding or truncation to the
+   requested 24fps duration before PyAV encoding.
+9. REST scheduling uses `PriorityQueue` entries `(priority, sequence, job_id)`.
+   Lower values run first; sequence preserves FIFO ties. Normal API jobs default
+   to 100 and local CLI tests use 0. Priority never preempts a running render.
 
 ## Key decisions
 

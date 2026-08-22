@@ -1,6 +1,63 @@
 # Active Context
 
-## Current focus (2026-08-07)
+## Current focus (2026-08-08)
+
+Ref2VA turbo at 544×960 / 10.4s / 4 pictures OOMed during denoise:
+92.75 GiB already allocated (resident denoiser plus conditioner) and a
+6.52 GiB step failed. The denoiser forward now offloads every other
+managed component first. `run_turbo.sh` generates at 416×736 and
+normalizes to 1080×1920.
+
+The server keeps the loaded pipeline resident after each job of the same task.
+Discard-after-every-job dropped the Python handle without returning ~89GB of
+VRAM, then `_check_gpu_free()` treated that leftover as a foreign occupant and
+rejected the next queued load. Reuse applies Turbo on the weights already on
+CUDA. The free-VRAM preflight now subtracts only other processes. Mode
+switches still replace the partition. The systemd unit uses `Restart=always`,
+a five-second delay, and unlimited start attempts.
+
+REST jobs now use a stable priority queue: normal callers default to priority
+100, while `queue_generate.py` and `test_turbo.sh` submit at priority 0. Lower
+values run first and FIFO order is preserved within a priority. Priority is
+non-preemptive, so an urgent CLI test becomes the next job without interrupting
+the render already on the GPU.
+
+Brightify's production `local_h3` engine is now linked to canonical
+`generation_jobs`. REST jobs accept normalized output width/height/duration;
+the hosted parity run upscaled H3 to 1920×1080, padded the hero hold to exactly
+10.0s, uploaded through the leased worker, finalized an `asset_version`, and
+passed compliance.
+
+REST jobs now accept `include_audio` (default true for backward compatibility).
+When false, H3 still performs joint video/audio inference but `encode_video`
+writes a silent MP4. Brightify's corrected Home Banner acceptance used
+`turbo=true` and `include_audio=false`; ffprobe confirmed one H.264 stream and
+no audio stream.
+
+The Ref2VA Gradio UI now labels image inputs as graphic references and shows a
+live `selected / 9` counter with multi-upload/order guidance. Existing backend
+limits remain authoritative: 9 images, 3 videos, 3 audios, 12 references total.
+
+The REST API now accepts up to nine `reference_image_urls` and routes those jobs
+through Ref2VA. References cannot be mixed with FL2VA keyframes; signed URLs
+are omitted from public job status. Turbo can be attached to `transformer_ref`
+experimentally because its module layout matches FL2VA, but the LoRA was not
+trained for Ref2VA and may weaken identity fidelity. Local job `1faa27936158`
+validated the path at 960×544/124 frames/5 steps in 84.9 seconds with a
+recognizable product across the generated turn. Brightify job `bea6178a…`
+validated a packshot as identity-only reference: generated campaign art appears
+at frame zero, with no white source canvas.
+
+Turbo is now the default for Gradio, REST, CLI, and Brightify H3 queue jobs.
+Callers can explicitly opt out (`turbo=false`, `--no-turbo`, or uncheck Turbo)
+to use the full-quality sampler.
+
+Brightify's fixture-level loop experiment validated a Ref2VA front→back v1
+followed by an FL2VA back→front v2 keyed from `v1:last` to `v1:first`. The
+assembled 10.292s loop measured ~3.5 MAE at the segment join and ~4.0 after
+encoding across the playback seam. General worker integration is still deferred.
+
+## Previous focus (2026-08-07)
 
 REST API added to `app.py`: FastAPI routes mounted alongside Gradio on the
 same port (7860) via `gr.mount_gradio_app` + uvicorn. `POST /api/generate`

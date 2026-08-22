@@ -1,0 +1,24 @@
+[Unit]
+Description=Local MiniMax H3 generation API
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=jason
+Group=jason
+WorkingDirectory=/home/jason/src/minimaxh3
+Environment=HF_HOME=/home/jason/.cache/hf
+Environment=MINIMAX_H3_HOST=127.0.0.1
+Environment=MINIMAX_H3_PORT=7860
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ExecStart=/home/jason/src/minimaxh3/.venv/bin/python /home/jason/src/minimaxh3/app.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

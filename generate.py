@@ -64,14 +64,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, help="Canvas height, multiple of 32 (default: model's 16:9 canvas)")
     p.add_argument("--width", type=int, help="Canvas width, multiple of 32")
     p.add_argument("--num-frames", type=int, help="Frame count; snapped up to 17*n+5, 24 fps, 5-15s")
-    p.add_argument("--steps", type=int, help="num_inference_steps (default: pipeline default; 5 with --turbo)")
+    p.add_argument("--steps", type=int, help="num_inference_steps (default: 5 with Turbo; pipeline default with --no-turbo)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--turbo",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Apply the community Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): "
         "4 model evaluations instead of ~50, roughly 10x faster sampling. Preview quality — "
-        "sharp, but can show plastic skin / over-sharp grain. FL2VA only.",
+        "sharp, but can show plastic skin / over-sharp grain. Ref2VA use is experimental "
+        "and may reduce reference identity fidelity. Enabled by default; use --no-turbo "
+        "for the full-quality sampler.",
     )
     p.add_argument(
         "--turbo-strength",
@@ -91,8 +94,6 @@ def parse_args() -> argparse.Namespace:
     args.refs = [_parse_ref(r) for r in args.ref]
     if args.refs and (args.image or args.last_image):
         p.error("--ref (ref2va) cannot be combined with --image/--last-image (fl2va)")
-    if args.turbo and args.refs:
-        p.error("--turbo is trained against the FL2VA transformer; not available with --ref")
     return args
 
 
@@ -189,7 +190,8 @@ def main() -> None:
     if args.turbo:
         from turbo import TURBO_NUM_INFERENCE_STEPS, load_turbo_lora
 
-        load_turbo_lora(pipe.transformer, strength=args.turbo_strength)
+        denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
+        load_turbo_lora(denoiser, strength=args.turbo_strength)
         if args.steps is None:
             args.steps = TURBO_NUM_INFERENCE_STEPS
         print(f"[+] Turbo LoRA applied (strength {args.turbo_strength}, steps {args.steps})", flush=True)

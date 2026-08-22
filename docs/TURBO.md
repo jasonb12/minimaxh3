@@ -9,16 +9,22 @@ lets H3-Base sample in **4 model evaluations instead of ~49**.
 baseline 248s → turbo 47s end-to-end (~5.3x); denoising itself ~4min → ~20s.
 
 **Status:** preview quality. `ckpt850` (EMA) is sharp at 4 steps but can show
-plastic-looking skin and over-sharp grain. FL2VA (t2va + keyframes) only — the
-LoRA targets the base/FL2VA transformer, not `transformer_ref`.
+plastic-looking skin and over-sharp grain. The LoRA was trained on FL2VA, but
+`transformer_ref` has the same target module layout, so this integration can
+attach it to Ref2VA as an **experimental** acceleration path. Ref2VA fidelity is
+not guaranteed: the LoRA author still describes native Ref2VA training as
+planned, and community tests report identity loss at very low step counts.
 
 ## Usage
 
 ```bash
-# CLI: --turbo applies the LoRA and defaults to 5 grid points (4 evals)
-python generate.py 'prompt...' --turbo
+# CLI: Turbo is on by default and uses 5 grid points (4 evals)
+python generate.py 'prompt...'
 python generate.py 'prompt...' --turbo --turbo-strength 0.9   # against grain
-# Web UI: check "Turbo" (steps auto-set to 5; strength slider appears)
+python generate.py 'Use <Picture 1> as the product...' \
+  --ref image:product.png  # experimental Ref2VA
+python generate.py 'prompt...' --no-turbo  # full-quality sampler
+# Web UI and REST API also default Turbo on; uncheck / send turbo=false to opt out.
 ```
 
 Strength is the sharpness/artifact dial: **up** (1.05–1.2) against blurry

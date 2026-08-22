@@ -2,6 +2,34 @@
 
 ## Works
 
+- Ref2VA denoise offloads the conditioner (and other siblings) before each
+  transformer forward so a resident pipe cannot keep ~93GB occupied. The
+  Cake Box turbo script uses 416×736 plus 1080×1920 output normalization.
+- Priority REST scheduling is available: normal jobs default to 100, queued CLI
+  tests use 0 and become next after the active render, with FIFO ordering among
+  equal priorities. `queue_generate.py` submits, polls and downloads output.
+- Queued REST/UI jobs reuse the resident pipeline instead of discarding it
+  after every encode. The previous discard left ~89GB allocated, then the
+  70GB free-VRAM check refused the next load. The preflight now ignores this
+  process's own VRAM. The service is configured to restart after any unexpected
+  exit.
+- Brightify production jobs can request deterministic output normalization
+  (dimensions and exact duration); 1920×1080/24fps/10.0s H3 output passed the
+  canonical asset/compliance pipeline.
+- REST API output audio is selectable with `include_audio`; false produces a
+  validated silent H.264 MP4 while preserving true as the direct-API default.
+- Ref2VA's Gradio gallery supports multiple graphic references and displays a
+  live count against the model limit (9 images; 12 mixed references total).
+- REST jobs support Ref2VA image-reference URLs without treating them as first
+  frames; status responses expose only the reference count, never the URLs.
+- Experimental Turbo Ref2VA is functional: the FL2VA-trained LoRA attaches to
+  `transformer_ref`, and job `1faa27936158` rendered 124 frames at 960×544 in
+  84.9 seconds. The output retained the Doritos product identity across a turn,
+  but the UI/docs warn that Ref2VA fidelity is not guaranteed.
+- Turbo defaults on across the UI, REST API, CLI, and Brightify requests;
+  full-quality sampling remains an explicit opt-out.
+- A two-segment loop test passed using Ref2VA v1 plus reversed-boundary FL2VA v2;
+  the assembled loop has low measured join/playback seam error.
 - REST API (docs/API.md) on the same port as the UI: job-based
   submit/poll/download under `/api/*`, FL2VA only, first/last frame via
   base64 or URL. Jobs in memory, mp4s in `outputs/api/`. Verified end-to-end

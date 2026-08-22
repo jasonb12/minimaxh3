@@ -49,8 +49,13 @@ hf download MiniMaxAI/MiniMax-H3 --include 'modular_model_index.json' 'transform
 
 Serves Gradio on `http://0.0.0.0:7860` (LAN-reachable, no auth — don't expose past the LAN).
 Pick **FL2VA** (text / first-last frame) or **Ref2VA** (reference images/video/audio). The matching
-transformer partition loads lazily on first use; switching modes reloads ~62GB of weights.
-Requests queue one at a time. Outputs land in `outputs/gradio/`.
+transformer partition loads on first use and stays resident for later jobs of
+the same task. Switching modes reloads ~62GB of weights. Requests run one at a
+time. Outputs land in `outputs/gradio/`.
+
+Ref2VA accepts up to **9 graphic/image references**, 3 video references, and
+3 audio references, with 12 references total. The UI shows a live graphic
+reference counter; upload order maps to `<Picture 1>`, `<Picture 2>`, and so on.
 
 ## REST API
 
@@ -64,7 +69,20 @@ curl -s http://localhost:7860/api/jobs/$JOB | jq          # queued -> running ->
 curl -o out.mp4 http://localhost:7860/api/jobs/$JOB/video
 ```
 
-FL2VA only (first/last frame via `image_b64`/`image_url`); videos persist in `outputs/api/`.
+The REST API supports FL2VA first/last frames and Ref2VA image references
+(`reference_image_urls`). Videos persist in `outputs/api/`.
+
+For an interactive test that should run immediately after the current render,
+use the queued CLI. Its default priority is 0; normal API jobs use 100:
+
+```bash
+.venv/bin/python 'queue_generate.py' 'A red panda waves at the camera' \
+  --priority '0' \
+  --output 'outputs/priority_test.mp4'
+```
+
+Priority does not interrupt a running generation. It moves the job ahead of
+normal jobs that are still queued. `test_turbo.sh` uses this priority path.
 
 ## CLI usage
 
@@ -93,10 +111,13 @@ Output lands in `outputs/` as an mp4 with the soundtrack muxed in.
 
 ## Turbo (~5x faster sampling)
 
-`--turbo` (CLI) or the Turbo checkbox (web UI) applies the community
+Turbo is enabled by default in the CLI, REST API, and web UI. It applies the community
 [4-step distillation LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora):
 4 model evaluations instead of ~49, measured 248s → 47s end-to-end at 960×544/5.2s.
-Preview quality (can show plastic skin / over-sharp grain); FL2VA only.
+Preview quality (can show plastic skin / over-sharp grain). Ref2VA can use the
+same structurally compatible adapter experimentally, but it was trained on
+FL2VA and may weaken reference identity.
+Use `--no-turbo`, `"turbo": false`, or uncheck Turbo for full-quality sampling.
 See [docs/TURBO.md](docs/TURBO.md) for the key-remapping details and tuning.
 
 Constraints to keep in mind:

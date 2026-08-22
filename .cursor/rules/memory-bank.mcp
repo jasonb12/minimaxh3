@@ -8,4 +8,26 @@
 - FL2VA vs Ref2VA: different transformer partitions (`transformer/` vs `transformer_ref/`).
   Build with `build_pipeline(..., task="ref2va")` / `--ref KIND:PATH`. Do not keep both
   resident — host RAM cannot hold two 62GB transformers plus the conditioner.
+- Ref2VA limits are 9 graphic/image refs, 3 video refs, 3 audio refs, and 12
+  total. Preserve upload order because prompts address them as `<Picture 1>`, etc.
+- REST image references use `reference_image_urls`; never echo signed URLs in
+  status. Reference mode is mutually exclusive with FL2VA keyframes. Turbo on
+  Ref2VA is experimental: the module layout accepts the FL2VA-trained LoRA, but
+  always warn that identity fidelity may be reduced.
+- Turbo is the default for UI, REST, CLI, and Brightify H3 jobs. Preserve an
+  explicit full-quality opt-out (`turbo=false` / `--no-turbo`).
+- Brightify production requests may specify output width/height/duration.
+  Normalize after generation, on CPU in bounded resize chunks, before encoding.
+- REST priority is lower-first and non-preemptive: production defaults to 100,
+  local CLI tests use 0, and sequence order preserves FIFO ties.
+- Before each denoiser forward, offload every other ComponentsManager module.
+  A resident pipe otherwise leaves the ~32GB conditioner on CUDA; Ref2VA then
+  OOMs around 93GB. Four-ref ~10s turbo jobs should generate at 416×736 (or
+  similar) and normalize up, not 544×960.
+- Keep the server pipeline resident for later jobs of the same task. Do not
+  discard after every REST job: that drops the Python handle without returning
+  ~89GB of VRAM, then the next load fails its own free-VRAM check. Count only
+  foreign processes in that check. Mode switches still detach hooks without
+  calling `offload()`; full CPU offload reaches 121GB RSS and triggers the
+  host OOM killer.
 - User prefers single quotes for static CLI arguments.
