@@ -13,7 +13,8 @@ Interactive docs (Swagger): `http://<host>:7860/api/docs`
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/api/generate` | Queue a generation, returns `{job_id, status_url}` |
-| GET | `/api/jobs/{id}` | Job status: `queued` / `running` / `done` / `error` |
+| GET | `/api/jobs/{id}` | Job status: `queued` / `running` / `cancelling` / `cancelled` / `done` / `error` |
+| POST | `/api/jobs/{id}/cancel` | Stop a queued or running job. Queued jobs end immediately; a running job raises at the next sampler step and frees the GPU lock. |
 | GET | `/api/jobs/{id}/video` | Download the mp4 (409 until done) |
 | GET | `/api/jobs` | 50 most recent jobs, newest first |
 

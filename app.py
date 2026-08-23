@@ -6,6 +6,7 @@ Serves on 0.0.0.0:7860, reachable from other machines on the network:
   /api/*       job-based REST API (see docs/API.md):
                  POST /api/generate        -> {"job_id": ...}
                  GET  /api/jobs/{id}       -> status / info / error
+                 POST /api/jobs/{id}/cancel -> stop a queued or running job
                  GET  /api/jobs/{id}/video -> the mp4
                  GET  /api/jobs            -> recent jobs
 
@@ -66,6 +67,10 @@ _pipe_lock = threading.Lock()
 # One generation at a time: the model saturates the GPU, and the turbo adapter
 # toggle mutates shared transformer state. Held by both the UI and API paths.
 _gen_lock = threading.Lock()
+
+
+class GenerationCancelled(Exception):
+    """Raised from a step callback when an operator cancels the running job."""
 
 
 def _foreign_vram_bytes() -> int:
@@ -281,6 +286,23 @@ def _normalize_output_video(video, width=None, height=None, duration_seconds=Non
     return video
 
 
+def _job_cancel_requested(job_id: str | None) -> bool:
+    if not job_id:
+        return False
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def _step_cancel_callback(job_id: str):
+    def callback(pipe, step_index, timestep, callback_kwargs):
+        if _job_cancel_requested(job_id):
+            raise GenerationCancelled(job_id)
+        return callback_kwargs
+
+    return callback
+
+
 def _run_generation(
     task,
     kwargs,
@@ -291,6 +313,7 @@ def _run_generation(
     output_width=None,
     output_height=None,
     output_duration_seconds=None,
+    job_id=None,
 ):
     """Toggle turbo, run the pipeline, and encode the mp4.
 
@@ -301,6 +324,8 @@ def _run_generation(
     from diffusers.utils.export_utils import encode_video
 
     with _gen_lock:
+        if _job_cancel_requested(job_id):
+            raise GenerationCancelled(job_id)
         pipe = _get_pipe(task)
         from turbo import load_turbo_lora, set_turbo_enabled
 
@@ -309,9 +334,19 @@ def _run_generation(
             load_turbo_lora(denoiser, strength=float(turbo_strength))
         set_turbo_enabled(denoiser, turbo)
         denoiser = _install_exclusive_gpu_guard(pipe)
+        call_kwargs = dict(kwargs)
+        if job_id:
+            import inspect
+
+            try:
+                parameters = inspect.signature(pipe.__call__).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "callback_on_step_end" in parameters:
+                call_kwargs["callback_on_step_end"] = _step_cancel_callback(job_id)
 
         t0 = time.time()
-        state = pipe(**kwargs)
+        state = pipe(**call_kwargs)
         elapsed = time.time() - t0
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,7 +559,12 @@ def _api_worker():
         _, _, job_id = _job_queue.get()
         with _jobs_lock:
             job = _jobs.get(job_id)
-            if job is None or job["status"] != "queued":
+            if job is None:
+                continue
+            if job.get("cancel_requested") or job["status"] in ("cancelled", "error", "done"):
+                job["status"] = "cancelled" if job["status"] not in ("error", "done") else job["status"]
+                continue
+            if job["status"] != "queued":
                 continue
             job["status"] = "running"
         try:
@@ -565,6 +605,7 @@ def _api_worker():
                 output_width=req.output_width,
                 output_height=req.output_height,
                 output_duration_seconds=req.output_duration_seconds,
+                job_id=job_id,
             )
 
             size_txt = f"{req.width}×{req.height}" if req.width and req.height else "auto"
@@ -587,6 +628,9 @@ def _api_worker():
                         f"generated in {elapsed / 60:.1f} min"
                     ),
                 )
+        except GenerationCancelled:
+            with _jobs_lock:
+                job.update(status="cancelled", error="Cancelled by operator")
         except Exception:
             with _jobs_lock:
                 job.update(status="error", error=traceback.format_exc(limit=8))
@@ -670,6 +714,24 @@ def api_job(job_id: str):
         job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job id.")
+    return _job_public(job)
+
+
+@api.post("/api/jobs/{job_id}/cancel")
+def api_cancel_job(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "Unknown job id.")
+        if job["status"] in ("done", "error", "cancelled"):
+            return _job_public(job)
+        job["cancel_requested"] = True
+        if job["status"] == "queued":
+            job["status"] = "cancelled"
+            job["error"] = "Cancelled by operator"
+        else:
+            job["status"] = "cancelling"
+            job["error"] = "Cancel requested"
     return _job_public(job)
 
 
