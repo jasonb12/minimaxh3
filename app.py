@@ -503,10 +503,10 @@ class GenerateRequest(BaseModel):
     seed: int = Field(-1, description="-1 = random")
     turbo: bool = True
     turbo_strength: float = Field(
-        0.85,
+        1.0,
         ge=0.5,
         le=1.5,
-        description="Turbo LoRA strength; 0.85 favors cleaner commercial motion",
+        description="Turbo LoRA strength; up fixes ghosting, down fixes grain",
     )
     include_audio: bool = Field(True, description="Mux H3's generated stereo audio into the MP4")
     output_width: int | None = Field(None, ge=2, description="Optional normalized output width")
@@ -825,7 +825,7 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 turbo_strength = gr.Slider(
                     0.5,
                     1.5,
-                    value=0.85,
+                    value=1.0,
                     step=0.05,
                     label="Turbo strength (up: fix ghosting · down: fix grain)",
                     visible=True,

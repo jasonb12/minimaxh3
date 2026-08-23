@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int)
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument("--turbo", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--turbo-strength", type=float, default=0.85)
+    parser.add_argument("--turbo-strength", type=float, default=1.0)
     parser.add_argument("--audio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--priority",
