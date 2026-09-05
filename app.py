@@ -47,6 +47,8 @@ OUTPUT_DIR = Path(__file__).parent / "outputs" / "gradio"
 # label -> (width, height); None means let the model pick its canvas
 # (matches the first keyframe's aspect ratio, 16:9 otherwise, 768px short edge)
 SIZES = {
+    "832×480 landscape (Spark fast)": (832, 480),
+    "480×832 portrait (Spark fast)": (480, 832),
     "960×544 landscape (fast)": (960, 544),
     "1344×768 landscape (native, ~2.3x slower)": (1344, 768),
     "544×960 portrait (fast)": (544, 960),
@@ -97,13 +99,28 @@ def _foreign_vram_bytes() -> int:
         if not line.strip():
             continue
         pid_text, mem_text = (part.strip() for part in line.split(",", 1))
-        if int(pid_text) != my_pid:
+        # GB10 reports [N/A] for per-process GPU memory on unified memory.
+        if pid_text.isdigit() and mem_text.isdigit() and int(pid_text) != my_pid:
             used += int(mem_text) * 1024**2
     return used
 
 
 def _check_gpu_free() -> None:
     import torch
+    from spark import use_spark
+
+    if use_spark():
+        import psutil
+        from spark import release_checkpoint_pages
+
+        release_checkpoint_pages()
+        available_bytes = min(torch.cuda.mem_get_info()[0], psutil.virtual_memory().available)
+        if available_bytes < 80 * 1024**3:
+            raise gr.Error(
+                f"Spark has {available_bytes / 1024**3:.1f} GiB available shared memory; "
+                "loading H3 requires 80 GiB. Stop other model processes first."
+            )
+        return
 
     total_bytes = torch.cuda.mem_get_info()[1]
     foreign_bytes = _foreign_vram_bytes()
@@ -182,6 +199,8 @@ def _offload_other_components(pipe, keep) -> None:
 def _install_exclusive_gpu_guard(pipe):
     """Offload sibling components on every denoiser forward."""
     denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
+    if getattr(pipe, "_h3_resident", False):
+        return denoiser
     if getattr(denoiser, "_h3_exclusive_gpu", False):
         return denoiser
 
@@ -387,6 +406,9 @@ def _run_generation(
         if turbo:
             load_turbo_lora(denoiser, strength=float(turbo_strength))
         set_turbo_enabled(denoiser, turbo)
+        from spark import prepare_spark_transformer
+
+        prepare_spark_transformer(pipe)
         denoiser = _install_exclusive_gpu_guard(pipe)
 
         generator = kwargs["generator"]
@@ -553,9 +575,9 @@ class GenerateRequest(BaseModel):
         max_length=MAX_REF_IMAGES,
         description="Product/style identity references for Ref2VA; not output frames",
     )
-    width: int | None = Field(None, description="Canvas width, multiple of 32 (omit both for model default)")
+    width: int | None = Field(None, description="Canvas width, multiple of 32 (omit both for server default)")
     height: int | None = None
-    seconds: float = Field(8.0, ge=5.2, le=14.4)
+    seconds: float = Field(float(os.environ.get("MINIMAX_H3_DEFAULT_SECONDS", "8.0")), ge=5.2, le=14.4)
     num_frames: int | None = Field(
         None,
         ge=120,
@@ -639,6 +661,9 @@ def _job_plan(req: "GenerateRequest", seed: int) -> dict:
     }
     if req.width and req.height:
         kwargs["width"], kwargs["height"] = req.width, req.height
+    elif os.environ.get("MINIMAX_H3_DEFAULT_WIDTH") and os.environ.get("MINIMAX_H3_DEFAULT_HEIGHT"):
+        kwargs["width"] = int(os.environ["MINIMAX_H3_DEFAULT_WIDTH"])
+        kwargs["height"] = int(os.environ["MINIMAX_H3_DEFAULT_HEIGHT"])
     if _job_task(req) == "ref2va":
         kwargs["references"] = build_references([("image", url) for url in req.reference_image_urls])
     else:
@@ -717,7 +742,7 @@ def _api_worker():
                 prefetch=prefetch,
             )
 
-            size_txt = f"{req.width}×{req.height}" if req.width and req.height else "auto"
+            size_txt = f"{kwargs['width']}×{kwargs['height']}" if kwargs.get("width") else "auto"
             output_txt = (
                 f" → {req.output_width}×{req.output_height}"
                 if req.output_width and req.output_height
@@ -918,8 +943,15 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 visible=False,
             )
             with gr.Row():
-                size = gr.Dropdown(list(SIZES), value="960×544 landscape (fast)", label="Canvas")
-                seconds = gr.Slider(5.2, 14.4, value=8.0, step=0.1, label="Duration (seconds)")
+                size = gr.Dropdown(
+                    list(SIZES),
+                    value=os.environ.get("MINIMAX_H3_DEFAULT_CANVAS", "960×544 landscape (fast)"),
+                    label="Canvas",
+                )
+                seconds = gr.Slider(
+                    5.2, 14.4, value=float(os.environ.get("MINIMAX_H3_DEFAULT_SECONDS", "8.0")),
+                    step=0.1, label="Duration (seconds)",
+                )
             with gr.Row():
                 steps = gr.Slider(4, 60, value=TURBO_NUM_INFERENCE_STEPS, step=1, label="Steps")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")

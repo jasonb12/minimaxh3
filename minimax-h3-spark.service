@@ -1,0 +1,35 @@
+[Unit]
+Description=MiniMax H3 video and audio generation on DGX Spark
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/minimaxh3
+Environment=HF_HOME=%h/.cache/hf
+Environment=HF_HUB_OFFLINE=1
+Environment=MINIMAX_H3_PROFILE=spark
+Environment=MINIMAX_H3_HOST=0.0.0.0
+Environment=MINIMAX_H3_PORT=7860
+Environment=MINIMAX_H3_DEFAULT_WIDTH=832
+Environment=MINIMAX_H3_DEFAULT_HEIGHT=480
+Environment=MINIMAX_H3_DEFAULT_SECONDS=5.2
+Environment="MINIMAX_H3_DEFAULT_CANVAS=832×480 landscape (Spark fast)"
+Environment=MINIMAX_H3_PREFETCH_JOBS=0
+Environment=MINIMAX_H3_CPU_THREADS=10
+Environment=MINIMAX_H3_COMPILE=1
+Environment=TRANSFORMERS_DISABLE_DEEPGEMM_LINEAR=1
+Environment=OMP_NUM_THREADS=10
+Environment=TORCHINDUCTOR_COMPILE_THREADS=4
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTORCH_ALLOC_CONF=expandable_segments:True
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/src/minimaxh3/.venv/bin/python %h/src/minimaxh3/app.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

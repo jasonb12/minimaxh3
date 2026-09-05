@@ -1,0 +1,5 @@
+# Native ARM64 CUDA 13 wheels. Install with --torch-backend=cu130.
+-r requirements.txt
+# Transformers' prequantized Qwen FP8 GEMM backend.
+kernels==0.15.2
+kernels-data==0.16.1

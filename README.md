@@ -16,6 +16,10 @@ Not set up here: the hosted **H3-Context-IR** / **H3-Regenerate-2K** API stages 
 
 ## Hardware fit (this machine)
 
+**DGX Spark / GB10:** use the [Spark setup](docs/SPARK.md). The `spark` profile
+uses resident FP8 models, compiled transformer blocks, and Turbo sampling. The
+configuration below describes the original RTX PRO 6000 host.
+
 Single RTX PRO 6000 Blackwell 96GB, 125GB host RAM.
 
 - Transformer: 61.7GB bf16 — full precision on GPU during denoising.

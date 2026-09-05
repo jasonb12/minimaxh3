@@ -109,6 +109,11 @@ def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
     if task not in ("fl2va", "ref2va"):
         raise ValueError(f"Unknown task {task!r}; expected 'fl2va' or 'ref2va'")
 
+    from spark import build_spark_pipeline, use_spark
+
+    if use_spark():
+        return build_spark_pipeline(MODEL_ID, task, bf16_text_encoder)
+
     manager = ComponentsManager()
     # diffusers 0.40 ships one auto blockset that dispatches t2va / fl2va /
     # ref2va on the inputs. Keep the full blocks (so a prompt-only request still
@@ -205,6 +210,9 @@ def main() -> None:
             args.steps = TURBO_NUM_INFERENCE_STEPS
         print(f"[+] Turbo LoRA applied (strength {args.turbo_strength}, steps {args.steps})", flush=True)
 
+    from spark import prepare_spark_transformer
+
+    prepare_spark_transformer(pipe)
     call_kwargs = {"prompt": args.prompt, "generator": torch.Generator().manual_seed(args.seed)}
     if task == "ref2va":
         call_kwargs["references"] = build_references(args.refs)
