@@ -64,17 +64,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, help="Canvas height, multiple of 32 (default: model's 16:9 canvas)")
     p.add_argument("--width", type=int, help="Canvas width, multiple of 32")
     p.add_argument("--num-frames", type=int, help="Frame count; snapped up to 17*n+5, 24 fps, 5-15s")
-    p.add_argument("--steps", type=int, help="num_inference_steps (default: 5 with Turbo; pipeline default with --no-turbo)")
+    p.add_argument("--steps", type=int, help="num_inference_steps (default: 7 with Turbo / 6 evals; pipeline default with --no-turbo)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--turbo",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Apply the community Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): "
-        "4 model evaluations instead of ~50, roughly 10x faster sampling. Preview quality — "
-        "sharp, but can show plastic skin / over-sharp grain. Ref2VA use is experimental "
-        "and may reduce reference identity fidelity. Enabled by default; use --no-turbo "
-        "for the full-quality sampler.",
+        help="Apply the community Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora, "
+        "v4-600 EMA): 6 model evaluations instead of ~50, roughly 5–10x faster sampling. "
+        "Preview quality. Ref2VA use is experimental and may reduce reference identity "
+        "fidelity. Enabled by default; use --no-turbo for the full-quality sampler.",
     )
     p.add_argument(
         "--turbo-strength",
@@ -111,12 +110,11 @@ def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
         raise ValueError(f"Unknown task {task!r}; expected 'fl2va' or 'ref2va'")
 
     manager = ComponentsManager()
-    if task == "ref2va":
-        from diffusers.modular_pipelines import MiniMaxH3Ref2VABlocks
-
-        pipe = MiniMaxH3Ref2VABlocks().init_pipeline(MODEL_ID, components_manager=manager)
-    else:
-        pipe = ModularPipeline.from_pretrained(MODEL_ID, components_manager=manager)
+    # diffusers 0.40 ships one auto blockset that dispatches t2va / fl2va /
+    # ref2va on the inputs. Keep the full blocks (so a prompt-only request still
+    # runs as t2va) and load only the components the task's workflow uses;
+    # otherwise `load_components` pulls both 62GB transformer partitions.
+    pipe = ModularPipeline.from_pretrained(MODEL_ID, components_manager=manager)
 
     if not bf16_text_encoder:
         # Official int8 recipe for the conditioner: halves its footprint with
@@ -143,32 +141,43 @@ def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
             ),
         )
 
-    pipe.load_components(dtype=torch.bfloat16)
-    # Ref2VA exposes the denoise weights as `transformer_ref`; FL2VA as `transformer`.
+    pipe.load_components(workflow=task, dtype=torch.bfloat16)
+    # Ref2VA denoises with `transformer_ref`; t2va/fl2va with `transformer`.
     denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
     denoiser.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
 
-    # 96GB card: transformer (61.7GB bf16) and conditioner cannot both stay
-    # resident; the manager swaps them between GPU and host RAM on demand.
-    manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin="12GB")
+    # 96GB card: transformer (61.7GB bf16) and conditioner (~32GB int8) cannot
+    # both stay resident at any margin; the manager swaps them between GPU and
+    # host RAM on demand. The margin is only activation headroom for whichever
+    # model is on the card. Tunable for other GPUs.
+    margin_gb = os.environ.get("MINIMAX_H3_RESERVE_MARGIN_GB", "12")
+    manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin=f"{margin_gb}GB")
     return pipe
 
 
 def build_references(refs: list[tuple[str, str]]):
-    """Turn `(kind, path)` pairs into `MiniMaxH3Reference` instances (order preserved)."""
-    from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
+    """Turn `(kind, path_or_url)` pairs into reference dataclasses (order preserved).
 
+    `from_file` decodes the media and keeps its native fps / sample rate, which
+    is what places a video or audio reference on the model's clock correctly.
+    """
+    from diffusers.modular_pipelines.minimax_h3 import (
+        MiniMaxH3AudioReference,
+        MiniMaxH3ImageReference,
+        MiniMaxH3VideoReference,
+    )
+
+    loaders = {
+        "image": MiniMaxH3ImageReference.from_file,
+        "video": MiniMaxH3VideoReference.from_file,
+        "audio": MiniMaxH3AudioReference.from_file,
+    }
     out = []
     for kind, path in refs:
-        if kind == "image":
-            out.append(MiniMaxH3Reference(image=path))
-        elif kind == "video":
-            out.append(MiniMaxH3Reference(video=path))
-        elif kind == "audio":
-            out.append(MiniMaxH3Reference(audio=path))
-        else:
+        if kind not in loaders:
             raise ValueError(f"Unknown reference kind {kind!r}")
+        out.append(loaders[kind](path))
     return out
 
 

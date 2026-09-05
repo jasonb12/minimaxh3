@@ -4,7 +4,10 @@
 - GPU is shared: `vllm.service` (user systemd) normally occupies ~93GB VRAM. Stop it before
   generation, and remember the user's Qwen endpoint on port 8000 goes down when you do.
 - Always use `HF_HOME=~/.cache/hf` — the default HF cache is root-owned and sudo is interactive.
-- diffusers is pinned to a PR commit; MiniMax-H3 is not in a diffusers release yet.
+- diffusers 0.40.0 (release). Anything that wraps `transformer.forward` must use
+  `functools.wraps`: the denoiser block selects layout kwargs by inspecting the forward
+  signature, and a bare `(*args, **kwargs)` wrapper silently drops them all.
+- `peft` is a real dependency (LoRA loader); keep it pinned in requirements.txt.
 - FL2VA vs Ref2VA: different transformer partitions (`transformer/` vs `transformer_ref/`).
   Build with `build_pipeline(..., task="ref2va")` / `--ref KIND:PATH`. Do not keep both
   resident — host RAM cannot hold two 62GB transformers plus the conditioner.
@@ -14,8 +17,19 @@
   status. Reference mode is mutually exclusive with FL2VA keyframes. Turbo on
   Ref2VA is experimental: the module layout accepts the FL2VA-trained LoRA, but
   always warn that identity fidelity may be reduced.
-- Turbo is the default for UI, REST, CLI, and Brightify H3 jobs. Preserve an
-  explicit full-quality opt-out (`turbo=false` / `--no-turbo`).
+- Turbo is the default for UI, REST, CLI, and Brightify H3 jobs. Default file is
+  `minimax_h3_turbo_v4_step600_ema.safetensors` at `steps=7` (6 evals) and
+  strength 1.0. `steps` is sigma grid points; evals = steps − 1. Preserve an
+  explicit full-quality opt-out (`turbo=false` / `--no-turbo`). v1-850 is only
+  for 4-step heavy motion.
+- LightX2V (lightx2v/Minimax-h3-Turbo) was evaluated Aug 2026 and rejected:
+  its Ref2VA 4-eval LoRA A/B'd faster but with poor output quality, so the
+  variant integration was removed. Do not re-add it; larryvrh is the only
+  Turbo family in use.
+- FastH3 (FastVideo Preview v1, Aug 2026) was reviewed and deferred: T2VA
+  only (no Ref2VA/FL2VA) and requires the FastVideo runtime + VSA kernels,
+  not a diffusers-loadable LoRA. Revisit only when their Ref2VA distillation
+  and an RTX (sm_120) recipe both ship.
 - Brightify production requests may specify output width/height/duration.
   Normalize after generation, on CPU in bounded resize chunks, before encoding.
 - REST priority is lower-first and non-preemptive: production defaults to 100,
@@ -30,4 +44,10 @@
   foreign processes in that check. Mode switches still detach hooks without
   calling `offload()`; full CPU offload reaches 121GB RSS and triggers the
   host OOM killer.
+- No `memory_reserve_margin` fits the 62GB transformer and 32GB conditioner
+  together on 96GB; the fix for swap churn is stage batching (encode several
+  queued prompts per conditioner residency), not a smaller margin. Only pair
+  jobs of the same task, and select prefetch candidates lazily under `_gen_lock`.
+- Restart the API without sudo by `kill -INT` on the app.py pid (unit has
+  `Restart=always`); never while a job is `running`.
 - User prefers single quotes for static CLI arguments.

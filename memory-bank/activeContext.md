@@ -1,6 +1,72 @@
 # Active Context
 
-## Current focus (2026-08-08)
+## Current focus (2026-09-02): staged scheduling
+
+The REST worker now runs jobs in two stages to avoid the per-job model swap.
+On 96GB the 62GB transformer and ~32GB int8 conditioner never fit together at
+any `memory_reserve_margin`, so each job used to pay: evict transformer (D2H
+62GB) → conditioner H2D → encode → conditioner D2H → transformer H2D → denoise.
+Measured ~10s per 62GB direction on this box.
+
+`app.py` splits the blockset at `_CONDITIONING_BLOCKS = ("before_encode",
+"text_encoder")` (was `"setup"` before diffusers 0.40.0). `_encode_conditioning` runs those on a `PipelineState` built
+like `ModularPipeline.__call__` and parks `prompt_embeds` on the CPU;
+`_denoise_from_conditioning` sets `generator`/`num_inference_steps`, moves the
+embeds back, and runs the rest. While the conditioner is on the GPU for job N,
+`_prefetch_candidates` (evaluated lazily at that moment, inside `_gen_lock`)
+encodes up to `MINIMAX_H3_PREFETCH_JOBS` (default 3) queued jobs of the same
+task into `job["conditioning"]`; those jobs skip the encode on their turn.
+Verified: three Turbo 960×544/5.2s jobs → 55.9s (encoding) / 37.2s / 37.6s
+(pre-encoded); a non-prefetched second job earlier measured 67.9s. Queued job
+status exposes `conditioning_ready`. `MINIMAX_H3_RESERVE_MARGIN_GB` (default 12)
+is exposed in `generate.py` but does not change residency math here.
+
+The `generator` is not consumed by the conditioning blocks, so splitting does
+not change the seed's three draws. Video references mutate
+`prepared_references[i].block_timestamps` in the text-encoder block; the same
+state object flows to the reference encoder, so that still works. The unused
+`callback_on_step_end` cancellation hook was removed (ModularPipeline never
+accepted it).
+
+Service restart without sudo: `kill -INT <app.py pid>`; the systemd unit's
+`Restart=always` brings it back in ~5s. Check the queue is idle first.
+
+## Previous focus (2026-08-29)
+
+**FastH3 reviewed, deferred.** FastVideo (Hao AI Lab) released FastH3 Preview
+v1 (Aug 28): DMD2 4-call distillation of base H3 plus 90% VSA sparse
+attention, up to 14x over base on B200. Not adopted: (1) T2VA only — no
+Ref2VA/FL2VA, our main workloads; (2) requires the FastVideo runtime (VSA-H3
+backend, custom kernels, their launchers) — the LoRAs carry VSA gate/exact-
+delta tensors and cannot load via generic PEFT into our diffusers pipeline;
+(3) optimized kernel is sm100a (B200), our RTX PRO 6000 (sm_120) only gets a
+Triton fallback; (4) vs our Turbo at 6 evals the marginal gain is small;
+(5) preview quality. **Revisit when their Ref2VA distillation + RTX recipe
+ship** (both on their public roadmap, Ref2VA "next few weeks").
+Blog: haoailab.com/blogs/fasth3-preview.
+
+**LightX2V rejected.** We briefly integrated
+lightx2v/Minimax-h3-Turbo `minimax_h3_ref2v_turbo_4step_v0.1_bf16` (the only
+Ref2VA-trained Turbo distillation) as an opt-in REST `turbo_variant` and ran a
+same-seed Cake Box Ref2VA A/B against larryvrh v4-600. It was ~29% faster
+(4.2 vs 5.9 min) and adhered to the raw cupcake reference better, but the
+overall output was judged poor (shopfront composition drift, duplicated
+signage, over-styled end card), so the variant plumbing was removed the same
+day. Do not re-add LightX2V; larryvrh is the only Turbo family. Their 768p
+FL2VA files would also need video shift 6, which the server has no plumbing
+for. `turbo.py` is back to single-adapter (`ADAPTER_NAME="turbo"`).
+
+## Previous focus (2026-08-26)
+
+Turbo default is now larryvrh **v4-600 EMA**
+(`minimax_h3_turbo_v4_step600_ema.safetensors`) at **7 grid points / 6 model
+evaluations** and **strength 1.0**. That matches the author's `--steps 6`
+recipe. v1-850 remains in the HF repo for 4-step heavy motion only. Key remap
+is unchanged (v4 is the same ComfyUI layout; 518 → 726 tensors). Docs:
+`docs/TURBO.md`. Server must be restarted to pick up the new adapter file
+because the PEFT adapter stays resident after first Turbo load.
+
+## Previous focus (2026-08-08)
 
 Ref2VA turbo at 544×960 / 10.4s / 4 pictures OOMed during denoise:
 92.75 GiB already allocated (resident denoiser plus conditioner) and a
@@ -106,5 +172,8 @@ via nohup, log at `/tmp/h3_gradio.log`. Restart after the Ref2VA code change.
 1. Finish `transformer_ref/*` download; smoke-test a single-image Ref2VA run
    (furniture / product) at 960x544.
 2. Default-canvas (1344x768) and fl2va (image-conditioned) runs.
-3. Unpin diffusers once MiniMax-H3 lands in a release.
+3. ~~Unpin diffusers~~ — done, on 0.40.0 since 2026-09-03. Delete
+   `.venv-pinned-abc5e9bf/` and the `../minimaxh3-next/` scratch copy once the
+   release build has run production jobs for a while.
 4. Set HF_TOKEN for faster future downloads.
+5. Clean up ~21GB of `.incomplete` blobs in `~/.cache/hf/hub`.

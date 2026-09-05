@@ -30,12 +30,20 @@ Single-script CLI (`generate.py`) + Gradio UI (`app.py`) around diffusers Modula
    frames and are never echoed in job-status payloads. The FL2VA-trained Turbo
    adapter can be loaded onto the structurally identical `transformer_ref`
    modules as an experimental path; preserve the identity-fidelity warning.
+   Default Turbo file is v4-600 EMA at 7 grid points (6 evals), strength 1.0.
 8. REST output normalization is post-generation and deterministic: bilinear
    resize in bounded CPU chunks, then final-frame padding or truncation to the
    requested 24fps duration before PyAV encoding.
 9. REST scheduling uses `PriorityQueue` entries `(priority, sequence, job_id)`.
    Lower values run first; sequence preserves FIFO ties. Normal API jobs default
    to 100 and local CLI tests use 0. Priority never preempts a running render.
+10. Two-stage execution: blocks `setup` + `text_encoder` (conditioner) run
+    separately from `vae/reference_encoder → … → decode` (transformer) on one
+    `PipelineState`, via `pipe._blocks.sub_blocks[name](pipe, state)`. The
+    worker pre-encodes the next few same-task queued jobs while the conditioner
+    is resident (`job["conditioning"]`, embeds parked on CPU) so they skip the
+    62GB transformer eviction/reload. Prefetch candidates are selected lazily
+    inside `_gen_lock` after the running job's own encode.
 
 ## Key decisions
 

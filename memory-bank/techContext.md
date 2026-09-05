@@ -12,8 +12,10 @@
 
 - Python 3.12 venv at `.venv/`, managed with `uv`.
 - torch 2.13.0+cu130 (CUDA 13 build required for Blackwell; installed with `--torch-backend=auto`).
-- diffusers pinned to PR #14355 commit `abc5e9bf` (MiniMax-H3 not in a release yet — check for a
-  proper release and unpin later).
+- diffusers 0.40.0 (first release with MiniMax-H3; upgraded 2026-09-03 from the PR #14355 commit
+  `abc5e9bf` pin). `.venv-pinned-abc5e9bf/` is the pre-upgrade venv, kept for rollback.
+- peft 0.20.0 must be pinned: diffusers' LoRA loader imports it lazily and `USE_PEFT_BACKEND` is
+  evaluated at import time, so installing it into a running service still needs a restart.
 - transformers 5.14.1, torchao 0.17.0 (int8 quant), av 18.0.0 (video/audio mux).
 
 ## Gotchas

@@ -31,10 +31,10 @@ JSON body (only `prompt` is required):
 | `width`, `height` | model default | Both or neither; multiples of 32 (e.g. 960×544) |
 | `seconds` | 8.0 | 5.2–14.4; snapped down to the 17n+5 frame grid at 24fps |
 | `num_frames` | none | Optional 120–360 override; the pipeline rounds to its 17n+5 grid |
-| `steps` | 50 (5 with turbo) | 4–60 |
+| `steps` | 50 (7 with turbo) | 4–60; turbo 7 = 6 model evals |
 | `seed` | -1 | -1 = random; the used seed is reported on the finished job |
-| `turbo` | true | 4-step LoRA, ~10x faster, preview quality; experimental with Ref2VA; set false for full quality |
-| `turbo_strength` | 1.0 | 0.5–1.5; up fixes ghosting, down fixes grain |
+| `turbo` | true | v4-600 LoRA, 6 evals, ~5–10x faster, preview quality; experimental with Ref2VA; set false for full quality |
+| `turbo_strength` | 1.0 | 0.5–1.5; leave at 1.0 unless a clip misbehaves; up fixes ghosting, down fixes grain |
 | `include_audio` | true | Set false to write a silent MP4 |
 | `priority` | 100 | Lower runs first; use 0 for an urgent CLI/test job |
 
@@ -95,6 +95,21 @@ curl -s 'http://localhost:7860/api/generate' \
 
 - Jobs live in process memory (restart clears the list); finished videos
   persist under `outputs/api/<job_id>.mp4`.
-- A queued job's response includes its priority-aware `queue_position`.
+- A queued job's response includes its priority-aware `queue_position` and
+  `conditioning_ready`, which turns true once its prompt has been pre-encoded.
 - Errors surface on the job as `status: "error"` with a traceback in `error`.
 - The first job after a server start loads the pipeline (~30s extra).
+
+## Staged scheduling
+
+The 62GB transformer and the ~32GB Qwen3-VL conditioner never fit on the 96GB
+card together, so every switch between them is a full host↔GPU copy of both
+(roughly 10s per 62GB direction). The worker therefore runs in two stages:
+while the conditioner is on the GPU for the running job, it also encodes the
+prompts of up to `MINIMAX_H3_PREFETCH_JOBS` (default 3) queued jobs of the same
+task and parks the embeddings on the CPU. Those jobs then skip the conditioner
+stage on their turn and denoise with the transformer already resident.
+Measured on Turbo 960×544/5.2s jobs: 37s for a pre-encoded job versus 56–68s
+for one that swaps models itself. `elapsed_seconds` on a job excludes the time
+spent pre-encoding others. Prefetch only pairs jobs of the same task (FL2VA or
+Ref2VA); a mode switch still reloads the transformer partition.

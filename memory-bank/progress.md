@@ -2,6 +2,15 @@
 
 ## Works
 
+- diffusers 0.40.0 upgrade (2026-09-03): `ModularPipeline.from_pretrained(workflow=...)`,
+  dataclass references, `_CONDITIONING_BLOCKS = ("before_encode", "text_encoder")`. Verified
+  FL2VA Turbo (55s) and Ref2VA Turbo (97s) at 960×544/5.2s; seed 1234 reproduces the same
+  composition as the `abc5e9bf` build. Two upgrade bugs fixed: `peft` unpinned, and the
+  exclusive-GPU guard hid the transformer signature (needs `functools.wraps`).
+- Staged REST scheduling: the conditioner stage for up to 3 queued same-task
+  jobs runs while the conditioner is already on the GPU; those jobs then
+  denoise with the transformer resident. Pre-encoded Turbo 960×544 jobs run in
+  ~37s versus 56–68s with a per-job swap. Verified end-to-end 2026-09-02.
 - Ref2VA denoise offloads the conditioner (and other siblings) before each
   transformer forward so a resident pipe cannot keep ~93GB occupied. The
   Cake Box turbo script uses 416×736 plus 1080×1920 output normalization.
@@ -35,9 +44,13 @@
   base64 or URL. Jobs in memory, mp4s in `outputs/api/`. Verified end-to-end
   with a turbo job (50s gen) plus validation/404 paths.
 
-- Turbo LoRA (docs/TURBO.md): 4-eval sampling via `--turbo` / web UI checkbox,
-  ~5.3x wall-clock speedup, verified on CLI and through the Gradio API.
-  Preview-quality caveats (plastic skin, grain) tunable via strength.
+- Turbo LoRA (docs/TURBO.md): v4-600 EMA via `--turbo` / web UI checkbox,
+  default 6 evals (`steps=7`) at strength 1.0. v1-850 at 4 evals measured
+  ~5.3x wall-clock (248s → 47s). Preview-quality caveats remain; v4 is meant
+  to drop the plastic/over-sharp look of v1.
+- LightX2V's Ref2VA-trained 4-eval Turbo LoRA was integrated, A/B tested
+  (faster but poor output quality) and **removed** — a direction chosen
+  against. See docs/TURBO.md "Rejected alternative".
 
 - Gradio web UI (`app.py`) on port 7860: FL2VA (prompt + optional first/last
   frames) and Ref2VA (reference images/videos/audio), canvas presets,

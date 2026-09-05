@@ -1,7 +1,14 @@
-"""MiniMax-H3 Turbo LoRA support: 4-step sampling instead of ~20 (~5x faster).
+"""MiniMax-H3 Turbo LoRA support: few-step sampling instead of ~20 (~5x faster).
 
 Community distillation LoRA by larryvrh (Apache-2.0):
 https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora
+
+Default weights are the v4-600 EMA checkpoint. The author recommends 6–8
+sampler steps for v4 (4 only for heavy motion, where v1-850 can still help).
+Our `num_inference_steps` is sigma grid points including terminal 0, so
+evals = steps - 1: default 7 grid points = 6 model evaluations, matching
+the author's `--steps 6` recipe. Strength stays at 1.0 unless a clip
+misbehaves.
 
 The LoRA is published against the ComfyUI checkpoint layout, so its keys are
 remapped to the diffusers `MiniMaxH3Transformer3DModel` module names before
@@ -11,13 +18,12 @@ bf16 base weights, most of the small update would round away.
 
 No sampler changes are needed in diffusers: the ComfyUI "Turbo Sampler" exists
 because ComfyUI steps video and audio on a single flow schedule, which
-over-steps the audio at 4 steps. The diffusers pipeline natively steps each
+over-steps the audio at few steps. The diffusers pipeline natively steps each
 stream on its own shifted scheduler (video shift 12, audio shift 3) over the
 same uniform grid, which is exactly the dual-clock integration the LoRA's own
-reference sampler implements. `num_inference_steps=5` gives 5 sigma grid points
-= 4 model evaluations = the LoRA's "4 steps".
+reference sampler implements.
 
-Key remapping (verified empirically against both checkpoints, see docs/TURBO.md):
+Key remapping (verified empirically against v1 and v4 checkpoints, see docs/TURBO.md):
   blocks.N.*                     -> transformer_blocks.N.*
   token_refiner.blocks.N.*       -> token_refiner.refiner_blocks.N.*
   attn.qkv_proj                  -> attn.to_q / to_k / to_v  (A shared, B split in thirds)
@@ -35,11 +41,12 @@ from pathlib import Path
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 
 TURBO_REPO = "larryvrh/MiniMax-H3-Turbo-Lora"
-TURBO_FILE = "minimax_h3_turbo_4step_ema_ckpt850.safetensors"
+TURBO_FILE = "minimax_h3_turbo_v4_step600_ema.safetensors"
 ADAPTER_NAME = "turbo"
 
-# 5 sigma grid points -> 4 model evaluations, the schedule the LoRA was trained for.
-TURBO_NUM_INFERENCE_STEPS = 5
+# 7 sigma grid points -> 6 model evaluations (author --steps 6). Useful range
+# 5–9 grid points (4–8 evals); past 9 the LoRA starts to over-sharpen.
+TURBO_NUM_INFERENCE_STEPS = 7
 
 
 def convert_turbo_lora_to_diffusers(state_dict):

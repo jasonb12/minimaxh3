@@ -22,7 +22,9 @@ Single RTX PRO 6000 Blackwell 96GB, 125GB host RAM.
 - Qwen3-VL-32B conditioner: quantized to int8 (~32GB) at load using the official torchao recipe,
   because bf16 for both components (~124GB) exceeds host RAM.
 - A diffusers `ComponentsManager` auto-swaps components between GPU and CPU
-  (`memory_reserve_margin="12GB"`).
+  (`memory_reserve_margin` 12GB, override with `MINIMAX_H3_RESERVE_MARGIN_GB`). No margin
+  lets the transformer and conditioner share the card, so the margin is activation
+  headroom only; the swap itself is avoided by staged scheduling (below).
 - `HF_HOME` defaults to `~/.cache/hf` (the standard `~/.cache/huggingface` is root-owned on this box).
 
 ## Setup
@@ -72,6 +74,11 @@ curl -o out.mp4 http://localhost:7860/api/jobs/$JOB/video
 The REST API supports FL2VA first/last frames and Ref2VA image references
 (`reference_image_urls`). Videos persist in `outputs/api/`.
 
+Queued jobs are scheduled in two stages: while the conditioner is on the GPU for
+one job, the prompts of the next few queued jobs (same task) are encoded too, so
+they later denoise without swapping the 62GB transformer out and back. Tune with
+`MINIMAX_H3_PREFETCH_JOBS` (default 3). See [docs/API.md](docs/API.md#staged-scheduling).
+
 For an interactive test that should run immediately after the current render,
 use the queued CLI. Its default priority is 0; normal API jobs use 100:
 
@@ -112,13 +119,15 @@ Output lands in `outputs/` as an mp4 with the soundtrack muxed in.
 ## Turbo (~5x faster sampling)
 
 Turbo is enabled by default in the CLI, REST API, and web UI. It applies the community
-[4-step distillation LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora):
-4 model evaluations instead of ~49, measured 248s → 47s end-to-end at 960×544/5.2s.
-Preview quality (can show plastic skin / over-sharp grain). Ref2VA can use the
-same structurally compatible adapter experimentally, but it was trained on
-FL2VA and may weaken reference identity.
+[v4-600 distillation LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+at 6 model evaluations (our `steps=7`) and strength 1.0 instead of ~49 steps.
+v1-850 at 4 evals measured 248s → 47s end-to-end at 960×544/5.2s; v4 at 6 evals
+is a bit slower and should look better (less plastic / over-sharp). Ref2VA can
+use the same structurally compatible adapter experimentally, but it was trained
+on FL2VA and may weaken reference identity.
 Use `--no-turbo`, `"turbo": false`, or uncheck Turbo for full-quality sampling.
-See [docs/TURBO.md](docs/TURBO.md) for the key-remapping details and tuning.
+See [docs/TURBO.md](docs/TURBO.md) for the key-remapping details, step mapping,
+and when to fall back to the older v1-850 file.
 
 Constraints to keep in mind:
 

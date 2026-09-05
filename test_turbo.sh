@@ -10,7 +10,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/queue_generate.py" "$1" \
     --turbo \
-    --steps '5' \
+    --steps '7' \
     --width '768' \
     --height '448' \
     --num-frames '300' \

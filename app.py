@@ -20,6 +20,7 @@ Run:  .venv/bin/python app.py
 """
 
 import base64
+import functools
 import gc
 import io
 import os
@@ -39,6 +40,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from generate import build_pipeline, build_references
+from turbo import TURBO_NUM_INFERENCE_STEPS
 
 OUTPUT_DIR = Path(__file__).parent / "outputs" / "gradio"
 
@@ -185,6 +187,9 @@ def _install_exclusive_gpu_guard(pipe):
 
     original_forward = denoiser.forward
 
+    # `wraps` keeps the real signature: the diffusers denoiser block picks the
+    # layout kwargs it passes by inspecting `transformer.forward`'s parameters.
+    @functools.wraps(original_forward)
     def forward(*args, **kwargs):
         _offload_other_components(pipe, denoiser)
         return original_forward(*args, **kwargs)
@@ -192,6 +197,54 @@ def _install_exclusive_gpu_guard(pipe):
     denoiser.forward = forward
     denoiser._h3_exclusive_gpu = True
     return denoiser
+
+
+# The blocks that need the ~32GB Qwen3-VL conditioner on the GPU. Everything
+# after them needs the 62GB transformer instead, and the two never fit on the
+# card together (62 + 32 + activations > 96GB), so each switch is a full
+# host<->device copy of both. Running this stage for several queued jobs while
+# the conditioner is resident, then denoising them back to back, pays that
+# copy once per batch instead of once per job.
+_CONDITIONING_BLOCKS = ("before_encode", "text_encoder")
+PREFETCH_ENCODE_JOBS = int(os.environ.get("MINIMAX_H3_PREFETCH_JOBS", "3"))
+
+
+def _pipeline_state(pipe, kwargs: dict):
+    """Seed a `PipelineState` the way `ModularPipeline.__call__` does."""
+    from diffusers.modular_pipelines import PipelineState
+
+    state = PipelineState()
+    for param in pipe._blocks.inputs:
+        if param.name in kwargs:
+            state.set(param.name, kwargs[param.name], param.kwargs_type)
+        elif param.name is not None and param.name not in state.values:
+            state.set(param.name, param.default, param.kwargs_type)
+    return state
+
+
+def _run_blocks(pipe, state, names):
+    import torch
+
+    blocks = pipe._blocks.sub_blocks
+    with torch.no_grad():
+        for name in names:
+            _, state = blocks[name](pipe, state)
+    return state
+
+
+def _encode_conditioning(pipe, kwargs: dict):
+    """Run the conditioner stage; park the embeddings on the CPU until denoise."""
+    state = _run_blocks(pipe, _pipeline_state(pipe, kwargs), _CONDITIONING_BLOCKS)
+    state.set("prompt_embeds", state.get("prompt_embeds").cpu())
+    return state
+
+
+def _denoise_from_conditioning(pipe, state, generator, num_inference_steps):
+    state.set("generator", generator)
+    state.set("num_inference_steps", num_inference_steps)
+    state.set("prompt_embeds", state.get("prompt_embeds").to(pipe._execution_device))
+    remaining = [name for name in pipe._blocks.sub_blocks if name not in _CONDITIONING_BLOCKS]
+    return _run_blocks(pipe, state, remaining)
 
 
 def _get_pipe(task: str):
@@ -294,15 +347,6 @@ def _job_cancel_requested(job_id: str | None) -> bool:
         return bool(job and job.get("cancel_requested"))
 
 
-def _step_cancel_callback(job_id: str):
-    def callback(pipe, step_index, timestep, callback_kwargs):
-        if _job_cancel_requested(job_id):
-            raise GenerationCancelled(job_id)
-        return callback_kwargs
-
-    return callback
-
-
 def _run_generation(
     task,
     kwargs,
@@ -314,12 +358,22 @@ def _run_generation(
     output_height=None,
     output_duration_seconds=None,
     job_id=None,
+    conditioning=None,
+    prefetch=None,
 ):
     """Toggle turbo, run the pipeline, and encode the mp4.
 
     Shared by the Gradio UI and the REST API; serialized on _gen_lock because
     the turbo adapter toggle mutates shared transformer state and the model
     saturates the GPU anyway. Returns generation wall time in seconds.
+
+    `conditioning` is a state from `_encode_conditioning` for this very
+    request; when given, the conditioner stage is skipped so the transformer
+    stays on the GPU. `prefetch` is a callable returning `(job, kwargs)` pairs
+    for queued jobs of the same task: their conditioner stage runs here, right
+    after this job's, while the conditioner is already on the GPU. It is
+    evaluated at that moment so jobs submitted during pipeline load or this
+    job's own encode are included.
     """
     from diffusers.utils.export_utils import encode_video
 
@@ -334,20 +388,29 @@ def _run_generation(
             load_turbo_lora(denoiser, strength=float(turbo_strength))
         set_turbo_enabled(denoiser, turbo)
         denoiser = _install_exclusive_gpu_guard(pipe)
-        call_kwargs = dict(kwargs)
-        if job_id:
-            import inspect
 
-            try:
-                parameters = inspect.signature(pipe.__call__).parameters
-            except (TypeError, ValueError):
-                parameters = {}
-            if "callback_on_step_end" in parameters:
-                call_kwargs["callback_on_step_end"] = _step_cancel_callback(job_id)
+        generator = kwargs["generator"]
+        num_inference_steps = kwargs["num_inference_steps"]
+        encode_kwargs = {k: v for k, v in kwargs.items() if k != "generator"}
 
         t0 = time.time()
-        state = pipe(**call_kwargs)
-        elapsed = time.time() - t0
+        prefetch_seconds = 0.0
+        if conditioning is None:
+            conditioning = _encode_conditioning(pipe, encode_kwargs)
+            t_prefetch = time.time()
+            for other_job, other_kwargs in prefetch() if prefetch else ():
+                if _job_cancel_requested(other_job["job_id"]):
+                    continue
+                try:
+                    other_state = _encode_conditioning(pipe, other_kwargs)
+                except Exception:
+                    # The job re-encodes on its own turn and reports its own error.
+                    continue
+                with _jobs_lock:
+                    other_job["conditioning"] = {"task": task, "state": other_state}
+            prefetch_seconds = time.time() - t_prefetch
+        state = _denoise_from_conditioning(pipe, conditioning, generator, num_inference_steps)
+        elapsed = time.time() - t0 - prefetch_seconds
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     video = _normalize_output_video(
@@ -499,7 +562,12 @@ class GenerateRequest(BaseModel):
         le=360,
         description="Optional frame count override; the pipeline rounds to its 17*n+5 grid.",
     )
-    steps: int | None = Field(None, ge=4, le=60, description="Defaults to 5 with Turbo; 50 when Turbo is disabled")
+    steps: int | None = Field(
+        None,
+        ge=4,
+        le=60,
+        description="Defaults to 7 with Turbo (6 model evals); 50 when Turbo is disabled",
+    )
     seed: int = Field(-1, description="-1 = random")
     turbo: bool = True
     turbo_strength: float = Field(
@@ -549,7 +617,61 @@ def _job_public(job: dict) -> dict:
         out["queue_position"] = next(
             (i for i, j in enumerate(queued) if j["job_id"] == job["job_id"]), 0
         )
+        out["conditioning_ready"] = "conditioning" in job
     return out
+
+
+def _job_task(req: "GenerateRequest") -> str:
+    return "ref2va" if req.reference_image_urls else "fl2va"
+
+
+def _job_plan(req: "GenerateRequest", seed: int) -> dict:
+    """Resolve a request into pipeline kwargs. Fetches any remote images."""
+    import torch
+
+    num_frames = req.num_frames if req.num_frames is not None else _snap_frames(req.seconds)
+    steps = req.steps if req.steps is not None else (TURBO_NUM_INFERENCE_STEPS if req.turbo else 50)
+    kwargs = {
+        "prompt": req.prompt.strip(),
+        "num_frames": num_frames,
+        "num_inference_steps": steps,
+        "generator": torch.Generator().manual_seed(seed),
+    }
+    if req.width and req.height:
+        kwargs["width"], kwargs["height"] = req.width, req.height
+    if _job_task(req) == "ref2va":
+        kwargs["references"] = build_references([("image", url) for url in req.reference_image_urls])
+    else:
+        image = _load_image(req.image_b64, req.image_url)
+        if image is not None:
+            kwargs["image"] = image
+        last = _load_image(req.last_image_b64, req.last_image_url)
+        if last is not None:
+            kwargs["last_image"] = last
+    return {"kwargs": kwargs, "num_frames": num_frames, "steps": steps}
+
+
+def _prefetch_candidates(task: str, exclude_job_id: str) -> list:
+    """Queued jobs of `task`, in run order, whose conditioner stage can run early."""
+    with _jobs_lock:
+        queued = [
+            j
+            for j in _jobs.values()
+            if j["status"] == "queued"
+            and j["job_id"] != exclude_job_id
+            and not j.get("cancel_requested")
+            and "conditioning" not in j
+            and _job_task(j["request"]) == task
+        ]
+    queued.sort(key=lambda j: (j["priority"], j["sequence"]))
+    prefetch = []
+    for job in queued[:PREFETCH_ENCODE_JOBS]:
+        try:
+            plan = _job_plan(job["request"], seed=0)
+        except Exception:
+            continue
+        prefetch.append((job, {k: v for k, v in plan["kwargs"].items() if k != "generator"}))
+    return prefetch
 
 
 def _api_worker():
@@ -563,36 +685,21 @@ def _api_worker():
                 continue
             if job.get("cancel_requested") or job["status"] in ("cancelled", "error", "done"):
                 job["status"] = "cancelled" if job["status"] not in ("error", "done") else job["status"]
+                job.pop("conditioning", None)
                 continue
             if job["status"] != "queued":
                 continue
             job["status"] = "running"
+            cached = job.pop("conditioning", None)
         try:
             req: GenerateRequest = job["request"]
             seed = req.seed if req.seed >= 0 else int(torch.seed() % 2**31)
-            num_frames = req.num_frames if req.num_frames is not None else _snap_frames(req.seconds)
-            steps = req.steps if req.steps is not None else (5 if req.turbo else 50)
+            task = _job_task(req)
+            plan = _job_plan(req, seed)
+            kwargs, num_frames, steps = plan["kwargs"], plan["num_frames"], plan["steps"]
 
-            task = "ref2va" if req.reference_image_urls else "fl2va"
-            kwargs = {
-                "prompt": req.prompt.strip(),
-                "num_frames": num_frames,
-                "num_inference_steps": steps,
-                "generator": torch.Generator().manual_seed(seed),
-            }
-            if req.width and req.height:
-                kwargs["width"], kwargs["height"] = req.width, req.height
-            if task == "ref2va":
-                kwargs["references"] = build_references(
-                    [("image", url) for url in req.reference_image_urls]
-                )
-            else:
-                image = _load_image(req.image_b64, req.image_url)
-                if image is not None:
-                    kwargs["image"] = image
-                last = _load_image(req.last_image_b64, req.last_image_url)
-                if last is not None:
-                    kwargs["last_image"] = last
+            conditioning = cached["state"] if cached and cached["task"] == task else None
+            prefetch = None if conditioning is not None else (lambda: _prefetch_candidates(task, job_id))
 
             out_path = API_OUTPUT_DIR / f"{job_id}.mp4"
             elapsed = _run_generation(
@@ -606,6 +713,8 @@ def _api_worker():
                 output_height=req.output_height,
                 output_duration_seconds=req.output_duration_seconds,
                 job_id=job_id,
+                conditioning=conditioning,
+                prefetch=prefetch,
             )
 
             size_txt = f"{req.width}×{req.height}" if req.width and req.height else "auto"
@@ -812,13 +921,13 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                 size = gr.Dropdown(list(SIZES), value="960×544 landscape (fast)", label="Canvas")
                 seconds = gr.Slider(5.2, 14.4, value=8.0, step=0.1, label="Duration (seconds)")
             with gr.Row():
-                steps = gr.Slider(4, 60, value=5, step=1, label="Steps")
+                steps = gr.Slider(4, 60, value=TURBO_NUM_INFERENCE_STEPS, step=1, label="Steps")
                 seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
             with gr.Row():
                 turbo = gr.Checkbox(
                     value=True,
                     label=(
-                        "Turbo (4-step LoRA, ~10x faster; preview quality; "
+                        "Turbo (v4 LoRA, 6 evals / ~5–10x faster; preview quality; "
                         "Ref2VA support is experimental and may reduce identity fidelity)"
                     ),
                 )
@@ -843,8 +952,6 @@ with gr.Blocks(title="MiniMax-H3") as demo:
     ref_images.change(_reference_image_count, [ref_images], [ref_image_count])
 
     def _toggle_turbo(enabled):
-        from turbo import TURBO_NUM_INFERENCE_STEPS
-
         return (
             gr.update(value=TURBO_NUM_INFERENCE_STEPS if enabled else 50),
             gr.update(visible=enabled),
