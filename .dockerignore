@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!app.py
+!generate.py
+!spark.py
+!turbo.py
+!queue_generate.py
+!docker/
+!docker/requirements-*.lock
+!docker/smoke.py
