@@ -13,7 +13,7 @@ Serves on 0.0.0.0:7860, reachable from other machines on the network:
 The pipeline loads lazily on the first generation and stays resident for later
 jobs of the same task. Discarding after every REST job dropped the Python
 handle without returning ~89GB of VRAM, so the next load saw 8GB free and
-refused. UI and API requests share one GPU lock, so they serialize. Switching
+refused. The UI submits to Brightify; only worker REST requests run inference. Switching
 FL2VA ↔ Ref2VA still reloads the transformer partition.
 
 Run:  .venv/bin/python app.py
@@ -37,7 +37,8 @@ os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 import gradio as gr
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing import Literal
 
 from generate import build_pipeline, build_references
 from turbo import TURBO_NUM_INFERENCE_STEPS
@@ -69,7 +70,7 @@ _pipe_task = None
 _pipe_lock = threading.Lock()
 
 # One generation at a time: the model saturates the GPU, and the turbo adapter
-# toggle mutates shared transformer state. Held by both the UI and API paths.
+# toggle mutates shared transformer state. Held by the worker REST execution path.
 _gen_lock = threading.Lock()
 
 
@@ -467,105 +468,34 @@ def _run_generation(
     return elapsed
 
 
-def generate(
-    mode,
-    prompt,
-    image,
-    last_image,
-    ref_images,
-    ref_videos,
-    ref_audios,
-    size,
-    seconds,
-    steps,
-    seed,
-    turbo,
-    turbo_strength,
-    progress=gr.Progress(),
-):
-    import torch
+def generate(mode, prompt, image, last_image, ref_images, ref_videos, ref_audios,
+             size, seconds, steps, seed, turbo, turbo_strength):
+    from gradio_queue import BrightifyQueue, status_text
+    try:
+        job = BrightifyQueue().submit(
+            "ref2va" if mode == MODE_REF2VA else "fl2va", prompt, image, last_image,
+            ref_images, ref_videos, ref_audios, SIZES[size], seconds, steps, seed,
+            turbo, turbo_strength)
+        return None, status_text(job), job["jobId"]
+    except Exception as error:
+        raise gr.Error(str(error)) from None
 
-    if not prompt or not prompt.strip():
-        raise gr.Error("A prompt is required.")
 
-    task = "ref2va" if mode == MODE_REF2VA else "fl2va"
-    num_frames = _snap_frames(seconds)
-    seed = int(seed)
-    if seed < 0:
-        seed = int(torch.seed() % 2**31)
-
-    refs = []
-    if task == "ref2va":
-        # Order: gallery images (upload order), then videos, then audios.
-        # Matches the usual "subject first, then motion/voice" pattern.
-        for item in ref_images or []:
-            # Gallery may yield a path str, (path, caption) tuple, or a dict.
-            if isinstance(item, (list, tuple)):
-                path = item[0]
-            elif isinstance(item, dict):
-                path = item.get("name") or item.get("path") or item.get("image")
-            else:
-                path = item
-            if path:
-                refs.append(("image", str(path)))
-        for path in ref_videos or []:
-            if path:
-                refs.append(("video", str(path)))
-        for path in ref_audios or []:
-            if path:
-                refs.append(("audio", str(path)))
-        if not refs:
-            raise gr.Error("Ref2VA needs at least one reference image, video, or audio.")
-        if all(kind == "audio" for kind, _ in refs):
-            raise gr.Error("Audio references cannot be the only inputs — add an image or video.")
-        n_img = sum(1 for k, _ in refs if k == "image")
-        n_vid = sum(1 for k, _ in refs if k == "video")
-        n_aud = sum(1 for k, _ in refs if k == "audio")
-        if (
-            n_img > MAX_REF_IMAGES
-            or n_vid > MAX_REF_VIDEOS
-            or n_aud > MAX_REF_AUDIOS
-            or len(refs) > MAX_REFS
-        ):
-            raise gr.Error(
-                f"Limits: ≤{MAX_REF_IMAGES} images, ≤{MAX_REF_VIDEOS} videos, "
-                f"≤{MAX_REF_AUDIOS} audios, ≤{MAX_REFS} total."
-            )
-
-    kwargs = {
-        "prompt": prompt.strip(),
-        "num_frames": num_frames,
-        "num_inference_steps": int(steps),
-        "generator": torch.Generator().manual_seed(seed),
-    }
-    if SIZES[size] is not None:
-        kwargs["width"], kwargs["height"] = SIZES[size]
-
-    if task == "ref2va":
-        kwargs["references"] = build_references(refs)
-    else:
-        if image is not None:
-            kwargs["image"] = image
-        if last_image is not None:
-            kwargs["last_image"] = last_image
-
-    progress(0.05, desc=f"Generating {num_frames / 24:.1f}s of video (takes minutes)")
-    out_path = OUTPUT_DIR / f"h3_{task}_{time.strftime('%Y%m%d_%H%M%S')}_seed{seed}.mp4"
-    elapsed = _run_generation(task, kwargs, turbo, turbo_strength, out_path)
-
-    size_txt = "×".join(map(str, SIZES[size])) if SIZES[size] else "auto"
-    ref_txt = f" · {len(refs)} refs" if task == "ref2va" else ""
-    turbo_txt = f" · turbo@{float(turbo_strength):g}" if turbo else ""
-    info = (
-        f"{task}{ref_txt}{turbo_txt} · seed {seed} · {num_frames} frames ({num_frames / 24:.1f}s) · "
-        f"{size_txt} · {int(steps)} steps · generated in {elapsed / 60:.1f} min"
-    )
-    return str(out_path), info
+def queue_status(job_id):
+    from gradio_queue import BrightifyQueue, status_text
+    if not job_id:
+        return gr.skip(), gr.skip(), gr.skip()
+    try:
+        job = BrightifyQueue().request("GET", f"/jobs/{job_id}")
+        terminal = job["status"] in ("done", "ready", "failed", "cancelled")
+        return job.get("downloadUrl") or gr.skip(), status_text(job), None if terminal else job_id
+    except Exception:
+        return gr.skip(), "Queue status temporarily unavailable; the submitted job remains in Brightify.", gr.skip()
 
 
 # --------------------------------------------------------------------------
 # REST API: POST /api/generate returns a job id; a single worker thread runs
-# jobs one at a time (sharing _gen_lock with the UI). Jobs live in memory;
+# worker requests one at a time. Gradio submits to Brightify. Local jobs live in memory;
 # finished videos persist under outputs/api/.
 # --------------------------------------------------------------------------
 
@@ -581,6 +511,10 @@ _job_queue: queue.PriorityQueue = queue.PriorityQueue()
 
 
 class GenerateRequest(BaseModel):
+    mode: Literal["ref2va", "fl2va"] | None = None
+    auto_canvas: bool = False
+    reference_video_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_VIDEOS)
+    reference_audio_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_AUDIOS)
     prompt: str = Field(..., min_length=1, description="Prompt, ideally shot-by-shot with a soundscape")
     image_b64: str | None = Field(None, description="First frame, base64 (raw or data URL)")
     image_url: str | None = Field(None, description="First frame, fetched from URL")
@@ -625,6 +559,17 @@ class GenerateRequest(BaseModel):
         description="Queue priority; lower runs first. Use 0 for an urgent CLI/test job.",
     )
 
+    @model_validator(mode="after")
+    def validate_reference_modes(self):
+        count = len(self.reference_image_urls) + len(self.reference_video_urls) + len(self.reference_audio_urls)
+        if count > MAX_REFS:
+            raise ValueError("At most 12 references are supported")
+        if count and (self.mode == "fl2va" or self.image_url or self.image_b64 or self.last_image_url or self.last_image_b64):
+            raise ValueError("Ref2VA and FL2VA inputs cannot be mixed")
+        if (self.mode == "ref2va" or count) and not (self.reference_image_urls or self.reference_video_urls):
+            raise ValueError("Ref2VA requires an image or video reference")
+        return self
+
 
 def _load_image(b64: str | None, url: str | None):
     from PIL import Image
@@ -660,7 +605,7 @@ def _job_public(job: dict) -> dict:
 
 
 def _job_task(req: "GenerateRequest") -> str:
-    return "ref2va" if req.reference_image_urls else "fl2va"
+    return req.mode or ("ref2va" if req.reference_image_urls or req.reference_video_urls or req.reference_audio_urls else "fl2va")
 
 
 def _job_plan(req: "GenerateRequest", seed: int) -> dict:
@@ -677,11 +622,14 @@ def _job_plan(req: "GenerateRequest", seed: int) -> dict:
     }
     if req.width and req.height:
         kwargs["width"], kwargs["height"] = req.width, req.height
-    elif os.environ.get("MINIMAX_H3_DEFAULT_WIDTH") and os.environ.get("MINIMAX_H3_DEFAULT_HEIGHT"):
+    elif not req.auto_canvas and os.environ.get("MINIMAX_H3_DEFAULT_WIDTH") and os.environ.get("MINIMAX_H3_DEFAULT_HEIGHT"):
         kwargs["width"] = int(os.environ["MINIMAX_H3_DEFAULT_WIDTH"])
         kwargs["height"] = int(os.environ["MINIMAX_H3_DEFAULT_HEIGHT"])
     if _job_task(req) == "ref2va":
-        kwargs["references"] = build_references([("image", url) for url in req.reference_image_urls])
+        kwargs["references"] = build_references(
+            [("image", url) for url in req.reference_image_urls]
+            + [("video", url) for url in req.reference_video_urls]
+            + [("audio", url) for url in req.reference_audio_urls])
     else:
         image = _load_image(req.image_b64, req.image_url)
         if image is not None:
@@ -806,7 +754,7 @@ def api_generate(req: GenerateRequest):
     )
     if req.reference_image_urls and has_keyframe:
         raise HTTPException(422, "Reference images cannot be combined with first/last-frame inputs.")
-    if any(not url.startswith(("http://", "https://")) for url in req.reference_image_urls):
+    if any(not url.startswith(("http://", "https://")) for url in req.reference_image_urls + req.reference_video_urls + req.reference_audio_urls):
         raise HTTPException(422, "Reference images must be HTTP(S) URLs.")
 
     job_id = uuid.uuid4().hex[:12]
@@ -818,6 +766,8 @@ def api_generate(req: GenerateRequest):
             "last_image_b64",
             "last_image_url",
             "reference_image_urls",
+            "reference_video_urls",
+            "reference_audio_urls",
         },
         exclude_none=True,
     )
@@ -902,8 +852,8 @@ with gr.Blocks(title="MiniMax-H3") as demo:
         "Joint video and stereo-audio generation, 24fps, 5–14.4s. "
         "Detailed shot-by-shot prompts with a soundscape description work best "
         "([prompting guide](https://huggingface.co/MiniMaxAI/MiniMax-H3)). "
-        "Generation takes several minutes. Switching FL2VA ↔ Ref2VA reloads the "
-        "transformer partition."
+        "Submissions enter the Brightify queue and run on an available worker. "
+        "You can close this page after submitting; the job stays in the queue."
     )
     mode = gr.Radio(
         [MODE_FL2VA, MODE_REF2VA],
@@ -987,10 +937,14 @@ with gr.Blocks(title="MiniMax-H3") as demo:
                     label="Turbo strength (up: fix ghosting · down: fix grain)",
                     visible=True,
                 )
-            btn = gr.Button("Generate", variant="primary")
+            btn = gr.Button("Add to Brightify queue", variant="primary")
         with gr.Column(scale=2):
             video = gr.Video(label="Result", autoplay=True)
             info = gr.Textbox(label="Run info", interactive=False)
+
+    queued_job = gr.State(None)
+    queue_timer = gr.Timer(5)
+    queue_timer.tick(queue_status, [queued_job], [video, info, queued_job], queue=False)
 
     mode.change(
         _mode_visibility,
@@ -1023,7 +977,8 @@ with gr.Blocks(title="MiniMax-H3") as demo:
             turbo,
             turbo_strength,
         ],
-        [video, info],
+        [video, info, queued_job],
+        concurrency_limit=4,
     )
 
 if __name__ == "__main__":

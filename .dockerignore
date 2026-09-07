@@ -12,3 +12,4 @@
 !download_spark.py
 !tests/
 !tests/*.py
+!gradio_queue.py

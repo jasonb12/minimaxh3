@@ -11,11 +11,11 @@ WORKDIR /app
 COPY docker/requirements-*.lock /tmp/locks/
 RUN uv venv --python /usr/bin/python3 /opt/venv && uv pip sync --python /opt/venv/bin/python --index https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match /tmp/locks/requirements-${TARGETARCH}.lock
 ENV PATH=/opt/venv/bin:$PATH HF_HOME=/cache/hf XDG_CACHE_HOME=/cache/runtime HOME=/tmp PYTHONUNBUFFERED=1 MINIMAX_H3_HOST=0.0.0.0 MINIMAX_H3_PORT=7860
-COPY app.py generate.py spark.py turbo.py queue_generate.py ./
+COPY app.py gradio_queue.py generate.py spark.py turbo.py queue_generate.py ./
 COPY docker/smoke.py /app/smoke.py
 COPY download_spark.py ./
 COPY tests ./tests
-RUN python -m py_compile app.py generate.py spark.py turbo.py
+RUN python -m py_compile app.py gradio_queue.py generate.py spark.py turbo.py
 RUN apt-get update && apt-get install -y --no-install-recommends python3-dev && rm -rf /var/lib/apt/lists/*
 USER 1000:1000
 EXPOSE 7860
