@@ -19,7 +19,9 @@ The image contains code and dependencies, not model weights or credentials.
 Compose mounts the existing HF cache at `/cache/hf`, a persistent compiler cache
 at `/cache/runtime`, and host outputs at `/app/outputs`. The API binds to port7860
 inside the container. Host publishing and hardware profiles are configured by
-Compose. Gate retains the `default` BF16/INT8 path; Spark selects `spark` FP8.
+Compose. Gate selects `resident-fp8` (FP8 transformer, pruned INT8 conditioner);
+Spark selects `spark` FP8. The `default` BF16/INT8 offload path remains available
+for rollback. See [RESIDENT.md](RESIDENT.md) for Gate validation and cutover.
 
 Health checks verify API availability; models load on the first request. The
 expanded `docker/smoke.py` verifies CUDA, model imports and actual Triton kernel

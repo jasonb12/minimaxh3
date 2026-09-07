@@ -109,9 +109,9 @@ def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
     if task not in ("fl2va", "ref2va"):
         raise ValueError(f"Unknown task {task!r}; expected 'fl2va' or 'ref2va'")
 
-    from spark import build_spark_pipeline, use_spark
+    from spark import build_spark_pipeline, use_resident_fp8
 
-    if use_spark():
+    if use_resident_fp8():
         return build_spark_pipeline(MODEL_ID, task, bf16_text_encoder)
 
     manager = ComponentsManager()

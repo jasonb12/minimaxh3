@@ -416,6 +416,8 @@ def _run_generation(
         encode_kwargs = {k: v for k, v in kwargs.items() if k != "generator"}
 
         t0 = time.time()
+        import torch
+        torch.cuda.reset_peak_memory_stats()
         prefetch_seconds = 0.0
         if conditioning is None:
             conditioning = _encode_conditioning(pipe, encode_kwargs)
@@ -431,8 +433,22 @@ def _run_generation(
                 with _jobs_lock:
                     other_job["conditioning"] = {"task": task, "state": other_state}
             prefetch_seconds = time.time() - t_prefetch
+        torch.cuda.synchronize()
+        conditioning_seconds = time.time() - t0 - prefetch_seconds
         state = _denoise_from_conditioning(pipe, conditioning, generator, num_inference_steps)
+        torch.cuda.synchronize()
         elapsed = time.time() - t0 - prefetch_seconds
+        if getattr(pipe, "_h3_resident", False):
+            components = {
+                name: sorted({str(p.device) for p in model.parameters()})
+                for name, model in (("denoiser", denoiser), ("conditioner", pipe.text_encoder),
+                                    ("vae", pipe.vae), ("audio_vae", pipe.audio_vae))
+            }
+            print(f"[resident-fp8] job={job_id} conditioning={conditioning_seconds:.2f}s "
+                  f"denoise_decode={elapsed-conditioning_seconds:.2f}s "
+                  f"peak_allocated={torch.cuda.max_memory_allocated()/1024**3:.2f}GiB "
+                  f"peak_reserved={torch.cuda.max_memory_reserved()/1024**3:.2f}GiB "
+                  f"devices={components}", flush=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     video = _normalize_output_video(

@@ -1,0 +1,11 @@
+# Code-only release on the previously validated, dependency-pinned runtime.
+# Build natively on each host, then publish an architecture-combined manifest.
+ARG BASE_IMAGE=jasonbrightglows/brightify:minimax-h3-docker-20260906
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+WORKDIR /app
+COPY app.py generate.py spark.py turbo.py queue_generate.py download_spark.py ./
+COPY docker/smoke.py ./smoke.py
+COPY tests ./tests
+RUN python -c "from pathlib import Path; [compile(p.read_text(), str(p), 'exec') for p in Path('.').glob('*.py')]"

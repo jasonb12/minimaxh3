@@ -8,3 +8,7 @@
 !docker/
 !docker/requirements-*.lock
 !docker/smoke.py
+!docker/Dockerfile.runtime
+!download_spark.py
+!tests/
+!tests/*.py

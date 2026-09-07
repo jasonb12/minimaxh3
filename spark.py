@@ -1,4 +1,4 @@
-"""GB10 runtime: resident FP8 models, with the original Turbo layer layout."""
+"""Resident FP8 runtime for GB10 and discrete Blackwell, preserving Turbo."""
 
 import importlib.metadata
 import os
@@ -37,9 +37,48 @@ def is_spark() -> bool:
 
 def use_spark() -> bool:
     profile = os.environ.get("MINIMAX_H3_PROFILE", "auto")
-    if profile not in ("auto", "spark", "default"):
-        raise ValueError("MINIMAX_H3_PROFILE must be auto, spark, or default")
+    if profile not in ("auto", "spark", "default", "resident-fp8"):
+        raise ValueError("MINIMAX_H3_PROFILE must be auto, spark, default, or resident-fp8")
     return profile == "spark" or (profile == "auto" and is_spark())
+
+
+def use_resident_fp8() -> bool:
+    # Keep Spark's shared-memory preflight separate from discrete GPU checks.
+    return use_spark() or os.environ.get("MINIMAX_H3_PROFILE") == "resident-fp8"
+
+
+def retain_conditioning_layer(encoder, layer=50):
+    """H3 only reads the pre-norm hidden state entering decoder layer 50.
+
+    Avoid Transformers' output_hidden_states collection retaining all 51 large
+    multimodal activations. This adapter is specific to H3's conditioner.
+    """
+    import functools
+    model = encoder.model
+    original = model.forward
+
+    @functools.wraps(original)
+    def forward(*args, **kwargs):
+        if not kwargs.get("output_hidden_states", False):
+            return original(*args, **kwargs)
+        captured = []
+
+        def capture(_module, inputs, named):
+            captured.append(inputs[0] if inputs else named["hidden_states"])
+
+        handle = model.language_model.layers[layer].register_forward_pre_hook(capture, with_kwargs=True)
+        try:
+            result = original(*args, **{**kwargs, "output_hidden_states": False})
+        finally:
+            handle.remove()
+        if len(captured) != 1:
+            raise RuntimeError("Expected exactly one H3 conditioning activation")
+        states = [None] * (encoder.config.text_config.num_hidden_layers + 1)
+        states[layer] = captured[0]
+        result.hidden_states = tuple(states)
+        return result
+
+    model.forward = forward
 
 
 def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = False):
@@ -52,7 +91,7 @@ def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = Fal
     from huggingface_hub import snapshot_download
 
     if bf16_text_encoder:
-        raise ValueError("The Spark profile needs an FP8 conditioner to preserve shared-memory headroom.")
+        raise ValueError("The resident profile requires a quantized conditioner for activation headroom.")
     torch.set_num_threads(int(os.environ.get("MINIMAX_H3_CPU_THREADS", "10")))
     component = "transformer_ref" if task == "ref2va" else "transformer"
     cache = (
@@ -93,23 +132,41 @@ def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = Fal
         (cache / "READY").write_text(MODEL_REVISION + "\n")
         release_checkpoint_pages()
 
-    encoder_id = "Qwen/Qwen3-VL-32B-Instruct-FP8"
-    encoder_source = snapshot_download(encoder_id, revision=ENCODER_REVISION, max_workers=4)
+    discrete = os.environ.get("MINIMAX_H3_PROFILE") == "resident-fp8"
+    encoder_id = model_id if discrete else "Qwen/Qwen3-VL-32B-Instruct-FP8"
+    encoder_source = snapshot_download(
+        encoder_id, revision=MODEL_REVISION if discrete else ENCODER_REVISION,
+        allow_patterns=["text_encoder/*"] if discrete else None, max_workers=4,
+    )
+    if discrete:
+        encoder_source = str(Path(encoder_source) / "text_encoder")
     release_checkpoint_pages()
     config = AutoConfig.from_pretrained(encoder_source)
     # The published checkpoint uses the vLLM spelling for its BF16 exclusions.
-    config.quantization_config["modules_to_not_convert"] = config.quantization_config["ignored_layers"]
+    if not discrete:
+        config.quantization_config["modules_to_not_convert"] = config.quantization_config["ignored_layers"]
     # H3 consumes hidden_states[50]. Keep 51 layers so that entry is still
     # pre-norm; the final hidden state is normalized by Qwen's forward.
     config.text_config.num_hidden_layers = 51
-    print("[spark] Loading prequantized FP8 conditioner (51 decoder layers)", flush=True)
+    encoder_options = {}
+    if discrete:
+        from torchao.quantization import Int8WeightOnlyConfig
+        from transformers import TorchAoConfig as EncoderTorchAoConfig
+        encoder_options["quantization_config"] = EncoderTorchAoConfig(
+            Int8WeightOnlyConfig(version=2),
+            modules_to_not_convert=["model.visual", "model.language_model.embed_tokens",
+                                    "model.language_model.norm", "lm_head"],
+        )
+    print(f"[resident] Loading {'INT8' if discrete else 'FP8'} conditioner (51 decoder layers)", flush=True)
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(
         encoder_source, config=config, dtype=torch.bfloat16, device_map={"": "cuda"},
         attn_implementation="sdpa",
+        **encoder_options,
     )
     # H3 calls encoder.model directly; its vocabulary projection is unused.
     encoder.lm_head = torch.nn.Identity()
     encoder.requires_grad_(False)
+    retain_conditioning_layer(encoder)
     release_checkpoint_pages()
 
     snapshot = snapshot_download(

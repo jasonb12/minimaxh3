@@ -44,6 +44,9 @@ on service restart.
   published precision. Only 51 decoder layers are loaded: H3 reads the
   **unnormalized `hidden_states[50]`**, so layer 51 preserves that convention;
   later layers and the vocabulary head are unused.
+- Only the activation entering decoder layer 50 is retained during conditioning;
+  the other hidden states are no longer collected. The selected tensor is
+  verified against unmodified Qwen in `tests/test_conditioner.py`.
 - Both models and the tiled VAEs stay on CUDA. CPU offload would move tensors
   within the same shared memory pool, adding copies without increasing capacity.
   The runtime advises Linux to release its own checkpoint file pages between
@@ -117,6 +120,12 @@ insufficient for the kernel library's offline snapshot lookup.
 The CUDA integration check is `.venv/bin/python -m unittest discover -s tests -v`.
 It checks FP8 serialization, compiled video/audio outputs, and adapter toggling
 on a small H3 model without downloading the full checkpoint.
+
+For the containerized deployment, run the same tests inside the native ARM64
+image. Compose explicitly points TorchInductor and Triton at `/cache/runtime`,
+so the mounted compiler cache survives container recreation. Keep
+`H3_PROFILE=spark`: this retains the prequantized FP8 conditioner and the
+shared-memory preflight. Gate's `resident-fp8` profile is a separate option.
 
 [NVIDIA's Sol Engine GB10 recipe](https://github.com/NVlabs/Sana/tree/sol-engine/models/minimax_h3/GB10)
 uses a pruned FP8 transformer, fused kernels, sparse attention, and cross-step
