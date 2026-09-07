@@ -100,4 +100,4 @@ def status_text(job):
         text += f" · {job['worker']}"
     if job.get("error"):
         text += f" · {job['error']}"
-    return text + f"\n{job['queueUrl']}"
+    return text + f"\n\n[View this job in Brightify queue]({job['queueUrl']})"

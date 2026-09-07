@@ -940,7 +940,7 @@ with gr.Blocks(title="MiniMax-H3") as demo:
             btn = gr.Button("Add to Brightify queue", variant="primary")
         with gr.Column(scale=2):
             video = gr.Video(label="Result", autoplay=True)
-            info = gr.Textbox(label="Run info", interactive=False)
+            info = gr.Markdown("Job status and a link to the Brightify queue will appear here.")
 
     queued_job = gr.State(None)
     queue_timer = gr.Timer(5)
