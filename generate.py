@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
+def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va", shared_components=None):
     """Build the FL2VA (`t2va`/`fl2va`) or Ref2VA (`ref2va`) modular pipeline.
 
     The two tasks load different transformer partitions from the same repo
@@ -112,7 +112,10 @@ def build_pipeline(bf16_text_encoder: bool, task: str = "fl2va"):
     from spark import build_spark_pipeline, use_resident_fp8
 
     if use_resident_fp8():
-        return build_spark_pipeline(MODEL_ID, task, bf16_text_encoder)
+        return build_spark_pipeline(MODEL_ID, task, bf16_text_encoder, shared_components)
+
+    if shared_components is not None:
+        raise ValueError("Shared components require the resident profile")
 
     manager = ComponentsManager()
     # diffusers 0.40 ships one auto blockset that dispatches t2va / fl2va /

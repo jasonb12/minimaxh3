@@ -67,6 +67,8 @@ MAX_REFS = 12
 
 _pipe = None
 _pipe_task = None
+# Retained across a failed transformer replacement so a retry does not reload them.
+_resident_shared = None
 _pipe_lock = threading.Lock()
 
 # One generation at a time: the model saturates the GPU, and the turbo adapter
@@ -268,19 +270,31 @@ def _denoise_from_conditioning(pipe, state, generator, num_inference_steps):
 
 
 def _get_pipe(task: str):
-    """Return the pipeline for `task`, swapping transformers if the mode changed."""
-    global _pipe, _pipe_task
+    """Reuse resident shared components; release the old transformer before loading."""
+    global _pipe, _pipe_task, _resident_shared
+    from spark import resident_shared_components
 
+    if task not in ("fl2va", "ref2va"):
+        raise ValueError(f"Unknown task: {task}")
     with _pipe_lock:
+        started = time.monotonic()
         if _pipe is not None and _pipe_task != task:
+            _resident_shared = resident_shared_components(_pipe)
             old_pipe = _pipe
             _discard_pipe(old_pipe)
             old_pipe = None
             _clear_model_memory()
         if _pipe is None:
-            _check_gpu_free()
-            _pipe = build_pipeline(bf16_text_encoder=False, task=task)
+            # Initial-load preflight assumes the entire GPU is available. During
+            # replacement our shared models intentionally still occupy CUDA.
+            if _resident_shared is None:
+                _check_gpu_free()
+            options = {"shared_components": _resident_shared} if _resident_shared is not None else {}
+            _pipe = build_pipeline(bf16_text_encoder=False, task=task, **options)
             _pipe_task = task
+            print(f"[pipeline] task={task} shared_reused={_resident_shared is not None} "
+                  f"load_seconds={time.monotonic() - started:.2f}", flush=True)
+            _resident_shared = None
     return _pipe
 
 

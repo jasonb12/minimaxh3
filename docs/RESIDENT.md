@@ -76,3 +76,27 @@ Production Compose now explicitly sets `TORCHINDUCTOR_CACHE_DIR` and
 `TRITON_CACHE_DIR` under `/cache/runtime`; previously TorchInductor used the
 container's temporary directory despite the runtime-cache mount. Existing
 compiled kernels from acceptance were copied into that persistent cache.
+
+## Switching render modes
+
+Resident profiles retain the conditioner, video/audio VAEs, tokenizer, processor,
+and both schedulers when switching FL2VA ↔ Ref2VA. Only the transformer is
+reloaded. The old pipeline and its component manager are collected before the
+replacement loads, avoiding simultaneous transformer allocations and avoiding
+a CUDA-to-CPU weight copy. Same-mode jobs continue using the same pipeline.
+
+A failed replacement retains shared components for the next request. Initial
+memory preflight runs only on a cold load; it must not reject the shared models
+that intentionally occupy GPU memory during a switch. Nonresident profiles
+retain their existing full-reload behavior. Turbo adapters and compilation are
+prepared on each new transformer as before. This does not retain both compiled
+transformers or eliminate transformer loading/compilation on a mode switch.
+
+`[pipeline]` logs report task, whether shared components were reused, and load
+time separately from generation time. `docker/reuse_smoke.py` is an opt-in
+full-weight acceptance check for FL2VA → Ref2VA → FL2VA. Run it in the candidate
+container with exclusive GPU access after draining the worker. It asserts
+shared-object identity, unchanged CUDA storage pointers, collection of the old
+transformer, and renders after each switch. `H3_REUSE_LOAD_ONLY=1` checks the
+load lifecycle without rendering. Never run a second full pipeline alongside
+the production runner on the same GPU.

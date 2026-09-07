@@ -81,7 +81,22 @@ def retain_conditioning_layer(encoder, layer=50):
     model.forward = forward
 
 
-def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = False):
+SHARED_COMPONENTS = ("text_encoder", "vae", "audio_vae", "tokenizer", "processor",
+                     "scheduler", "audio_scheduler")
+
+
+def resident_shared_components(pipe):
+    """Keep shared objects alive while the old pipeline/manager is collected."""
+    if not getattr(pipe, "_h3_resident", False):
+        return None
+    shared = {name: getattr(pipe, name) for name in SHARED_COMPONENTS}
+    if any(value is None for value in shared.values()):
+        raise RuntimeError("Cannot reuse an incomplete resident pipeline")
+    return shared
+
+
+def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = False,
+                         shared_components=None):
     import gc
     import torch
     from diffusers import ComponentsManager, MiniMaxH3Transformer3DModel, ModularPipeline, TorchAoConfig
@@ -90,6 +105,13 @@ def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = Fal
     from transformers import AutoConfig, Qwen3VLForConditionalGeneration
     from huggingface_hub import snapshot_download
 
+    if task not in ("fl2va", "ref2va"):
+        raise ValueError(f"Unknown task: {task}")
+    if shared_components is not None and (
+        set(shared_components) != set(SHARED_COMPONENTS)
+        or any(value is None for value in shared_components.values())
+    ):
+        raise ValueError("Expected all shared resident components")
     if bf16_text_encoder:
         raise ValueError("The resident profile requires a quantized conditioner for activation headroom.")
     torch.set_num_threads(int(os.environ.get("MINIMAX_H3_CPU_THREADS", "10")))
@@ -132,42 +154,47 @@ def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = Fal
         (cache / "READY").write_text(MODEL_REVISION + "\n")
         release_checkpoint_pages()
 
-    discrete = os.environ.get("MINIMAX_H3_PROFILE") == "resident-fp8"
-    encoder_id = model_id if discrete else "Qwen/Qwen3-VL-32B-Instruct-FP8"
-    encoder_source = snapshot_download(
-        encoder_id, revision=MODEL_REVISION if discrete else ENCODER_REVISION,
-        allow_patterns=["text_encoder/*"] if discrete else None, max_workers=4,
-    )
-    if discrete:
-        encoder_source = str(Path(encoder_source) / "text_encoder")
-    release_checkpoint_pages()
-    config = AutoConfig.from_pretrained(encoder_source)
-    # The published checkpoint uses the vLLM spelling for its BF16 exclusions.
-    if not discrete:
-        config.quantization_config["modules_to_not_convert"] = config.quantization_config["ignored_layers"]
-    # H3 consumes hidden_states[50]. Keep 51 layers so that entry is still
-    # pre-norm; the final hidden state is normalized by Qwen's forward.
-    config.text_config.num_hidden_layers = 51
-    encoder_options = {}
-    if discrete:
-        from torchao.quantization import Int8WeightOnlyConfig
-        from transformers import TorchAoConfig as EncoderTorchAoConfig
-        encoder_options["quantization_config"] = EncoderTorchAoConfig(
-            Int8WeightOnlyConfig(version=2),
-            modules_to_not_convert=["model.visual", "model.language_model.embed_tokens",
-                                    "model.language_model.norm", "lm_head"],
+    if shared_components is None:
+        discrete = os.environ.get("MINIMAX_H3_PROFILE") == "resident-fp8"
+        encoder_id = model_id if discrete else "Qwen/Qwen3-VL-32B-Instruct-FP8"
+        encoder_source = snapshot_download(
+            encoder_id, revision=MODEL_REVISION if discrete else ENCODER_REVISION,
+            allow_patterns=["text_encoder/*"] if discrete else None, max_workers=4,
         )
-    print(f"[resident] Loading {'INT8' if discrete else 'FP8'} conditioner (51 decoder layers)", flush=True)
-    encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-        encoder_source, config=config, dtype=torch.bfloat16, device_map={"": "cuda"},
-        attn_implementation="sdpa",
-        **encoder_options,
-    )
-    # H3 calls encoder.model directly; its vocabulary projection is unused.
-    encoder.lm_head = torch.nn.Identity()
-    encoder.requires_grad_(False)
-    retain_conditioning_layer(encoder)
-    release_checkpoint_pages()
+        if discrete:
+            encoder_source = str(Path(encoder_source) / "text_encoder")
+        release_checkpoint_pages()
+        config = AutoConfig.from_pretrained(encoder_source)
+        # The published checkpoint uses the vLLM spelling for its BF16 exclusions.
+        if not discrete:
+            config.quantization_config["modules_to_not_convert"] = config.quantization_config["ignored_layers"]
+        # H3 consumes hidden_states[50]. Keep 51 layers so that entry is still
+        # pre-norm; the final hidden state is normalized by Qwen's forward.
+        config.text_config.num_hidden_layers = 51
+        encoder_options = {}
+        if discrete:
+            from torchao.quantization import Int8WeightOnlyConfig
+            from transformers import TorchAoConfig as EncoderTorchAoConfig
+            encoder_options["quantization_config"] = EncoderTorchAoConfig(
+                Int8WeightOnlyConfig(version=2),
+                modules_to_not_convert=["model.visual", "model.language_model.embed_tokens",
+                                        "model.language_model.norm", "lm_head"],
+            )
+        print(f"[resident] Loading {'INT8' if discrete else 'FP8'} conditioner (51 decoder layers)", flush=True)
+        encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+            encoder_source, config=config, dtype=torch.bfloat16, device_map={"": "cuda"},
+            attn_implementation="sdpa",
+            **encoder_options,
+        )
+        # H3 calls encoder.model directly; its vocabulary projection is unused.
+        encoder.lm_head = torch.nn.Identity()
+        encoder.requires_grad_(False)
+        retain_conditioning_layer(encoder)
+        release_checkpoint_pages()
+
+    else:
+        encoder = shared_components["text_encoder"]
+        print("[resident] Reusing CUDA conditioner, video/audio VAEs and shared components", flush=True)
 
     snapshot = snapshot_download(
         model_id, revision=MODEL_REVISION, max_workers=4,
@@ -179,6 +206,8 @@ def build_spark_pipeline(model_id: str, task: str, bf16_text_encoder: bool = Fal
     manager = ComponentsManager()
     pipe = ModularPipeline.from_pretrained(snapshot, components_manager=manager)
     pipe.update_components(**{component: denoiser, "text_encoder": encoder})
+    if shared_components is not None:
+        pipe.update_components(**shared_components)
     # Direct component directories also avoid an AutoProcessor subfolder/revision
     # lookup bug and Diffusers' sharded-checkpoint Hub metadata request offline.
     pipe.load_components(
