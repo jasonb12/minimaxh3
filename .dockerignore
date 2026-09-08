@@ -13,3 +13,5 @@
 !tests/
 !tests/*.py
 !gradio_queue.py
+
+!job_store.py
