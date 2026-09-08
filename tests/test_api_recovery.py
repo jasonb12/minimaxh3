@@ -7,6 +7,22 @@ from job_store import JobStore
 
 
 class ApiRecoveryTests(unittest.TestCase):
+    def test_health_does_not_synchronize_an_active_render(self):
+        with app._gen_lock, patch('torch.cuda.synchronize') as synchronize:
+            self.assertEqual(app.api_health(), {'status': 'ok', 'inference': 'busy'})
+            synchronize.assert_not_called()
+
+    def test_idle_health_exercises_cuda_and_releases_inference_lock(self):
+        with patch('torch.empty') as empty, patch('torch.cuda.synchronize') as synchronize:
+            self.assertEqual(app.api_health(), {'status': 'ok'})
+            empty.assert_called_once_with(1, device='cuda')
+            synchronize.assert_called_once()
+        with patch('torch.empty', side_effect=RuntimeError('device lost')):
+            with self.assertRaises(app.HTTPException) as unavailable:
+                app.api_health()
+            self.assertEqual(unavailable.exception.status_code, 503)
+        self.assertFalse(app._gen_lock.locked())
+
     def test_duplicate_submission_and_restart_reconnect_without_enqueuing_twice(self):
         with tempfile.TemporaryDirectory() as root, patch.object(app, '_jobs', {}), patch.object(app, '_job_queue') as queue, patch.object(app, '_job_store', JobStore(root)):
             req = app.GenerateRequest(prompt='Test', idempotency_key='brightify-job:1')

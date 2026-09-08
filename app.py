@@ -786,6 +786,11 @@ async def authorize_api(request: Request, call_next):
 def api_health():
     if _fatal_error:
         raise HTTPException(503, _fatal_error)
+    # A device-wide synchronize waits for every in-flight inference kernel.
+    # Do not queue health requests behind a long render (or fill the HTTP
+    # thread pool with them). The inference error handler owns busy health.
+    if not _gen_lock.acquire(blocking=False):
+        return {'status': 'ok', 'inference': 'busy'}
     try:
         import torch
         # Exercise CUDA; an HTTP server surviving a lost GPU is not healthy.
@@ -793,6 +798,8 @@ def api_health():
         torch.cuda.synchronize()
     except Exception:
         raise HTTPException(503, 'CUDA unavailable') from None
+    finally:
+        _gen_lock.release()
     return {'status': 'ok'}
 
 
