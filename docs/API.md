@@ -135,3 +135,8 @@ except health. Direct startup now binds loopback by default. Container access
 uses the configured host binding; LAN deployments must configure the token.
 Queue admissions are capped at eight pending/running jobs and canvas/output
 sizes and prompt length are bounded.
+
+Verification: `python -m unittest discover -s tests` inside the pinned runtime
+(with a writable `/app/outputs` mount). CI runs the portable receipt tests and
+syntax checks; model lifecycle and API tests run in the release image. GPU
+inference is a separate acceptance check and is never implied by CPU CI.
