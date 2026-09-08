@@ -25,6 +25,7 @@ import gc
 import io
 import os
 import queue
+import secrets
 import threading
 import time
 import traceback
@@ -35,7 +36,9 @@ from pathlib import Path
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf"))
 
 import gradio as gr
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from job_store import JobStore, is_fatal_cuda
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
@@ -442,7 +445,9 @@ def _run_generation(
                     continue
                 try:
                     other_state = _encode_conditioning(pipe, other_kwargs)
-                except Exception:
+                except Exception as error:
+                    if is_fatal_cuda(error):
+                        raise
                     # The job re-encodes on its own turn and reports its own error.
                     continue
                 with _jobs_lock:
@@ -515,21 +520,25 @@ def queue_status(job_id):
 
 API_OUTPUT_DIR = Path(__file__).parent / "outputs" / "api"
 MAX_JOBS_KEPT = 200
+MAX_PENDING_JOBS = 8
+_job_store = JobStore(API_OUTPUT_DIR / "manifests")
+_fatal_error = None
 DEFAULT_PRIORITY = 100
 CLI_PRIORITY = 0
 
-_jobs: dict = {}
+_jobs: dict = _job_store.recover()
 _jobs_lock = threading.Lock()
 _job_sequence = count()
 _job_queue: queue.PriorityQueue = queue.PriorityQueue()
 
 
 class GenerateRequest(BaseModel):
+    idempotency_key: str | None = Field(None, min_length=1, max_length=200)
     mode: Literal["ref2va", "fl2va"] | None = None
     auto_canvas: bool = False
     reference_video_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_VIDEOS)
     reference_audio_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_AUDIOS)
-    prompt: str = Field(..., min_length=1, description="Prompt, ideally shot-by-shot with a soundscape")
+    prompt: str = Field(..., min_length=1, max_length=30000, description="Prompt, ideally shot-by-shot with a soundscape")
     image_b64: str | None = Field(None, description="First frame, base64 (raw or data URL)")
     image_url: str | None = Field(None, description="First frame, fetched from URL")
     last_image_b64: str | None = None
@@ -539,8 +548,8 @@ class GenerateRequest(BaseModel):
         max_length=MAX_REF_IMAGES,
         description="Product/style identity references for Ref2VA; not output frames",
     )
-    width: int | None = Field(None, description="Canvas width, multiple of 32 (omit both for server default)")
-    height: int | None = None
+    width: int | None = Field(None, ge=32, le=1536, description="Canvas width, multiple of 32 (omit both for server default)")
+    height: int | None = Field(None, ge=32, le=1536)
     seconds: float = Field(float(os.environ.get("MINIMAX_H3_DEFAULT_SECONDS", "8.0")), ge=5.2, le=14.4)
     num_frames: int | None = Field(
         None,
@@ -563,8 +572,8 @@ class GenerateRequest(BaseModel):
         description="Turbo LoRA strength; up fixes ghosting, down fixes grain",
     )
     include_audio: bool = Field(True, description="Mux H3's generated stereo audio into the MP4")
-    output_width: int | None = Field(None, ge=2, description="Optional normalized output width")
-    output_height: int | None = Field(None, ge=2, description="Optional normalized output height")
+    output_width: int | None = Field(None, ge=2, le=4096, description="Optional normalized output width")
+    output_height: int | None = Field(None, ge=2, le=4096, description="Optional normalized output height")
     output_duration_seconds: float | None = Field(None, gt=0, le=30)
     priority: int = Field(
         DEFAULT_PRIORITY,
@@ -678,7 +687,7 @@ def _prefetch_candidates(task: str, exclude_job_id: str) -> list:
 
 
 def _api_worker():
-    import torch
+    global _fatal_error
 
     while True:
         _, _, job_id = _job_queue.get()
@@ -693,10 +702,11 @@ def _api_worker():
             if job["status"] != "queued":
                 continue
             job["status"] = "running"
+            _job_store.save(job)
             cached = job.pop("conditioning", None)
         try:
             req: GenerateRequest = job["request"]
-            seed = req.seed if req.seed >= 0 else int(torch.seed() % 2**31)
+            seed = req.seed if req.seed >= 0 else secrets.randbelow(2**31)
             task = _job_task(req)
             plan = _job_plan(req, seed)
             kwargs, num_frames, steps = plan["kwargs"], plan["num_frames"], plan["steps"]
@@ -743,14 +753,47 @@ def _api_worker():
         except GenerationCancelled:
             with _jobs_lock:
                 job.update(status="cancelled", error="Cancelled by operator")
-        except Exception:
+        except Exception as error:
             with _jobs_lock:
                 job.update(status="error", error=traceback.format_exc(limit=8))
+                if is_fatal_cuda(error):
+                    _fatal_error = "Fatal CUDA failure; inference process is restarting"
+        finally:
+            with _jobs_lock:
+                _job_store.save(job)
+        if _fatal_error:
+            # Persist the failed receipt first, stop admissions immediately, then
+            # exit so the container restart policy creates a fresh CUDA context.
+            time.sleep(5)
+            os._exit(70)
 
 
 threading.Thread(target=_api_worker, daemon=True, name="api-worker").start()
 
 api = FastAPI(title="MiniMax-H3 API", docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+
+@api.middleware("http")
+async def authorize_api(request: Request, call_next):
+    if request.url.path.startswith('/api/') and request.url.path != '/api/health':
+        token = os.environ.get('MINIMAX_H3_TOKEN', '')
+        if token and not secrets.compare_digest(request.headers.get('authorization', ''), f'Bearer {token}'):
+            return JSONResponse(status_code=401, content={'detail': 'Unauthorized'})
+    return await call_next(request)
+
+
+@api.get('/api/health')
+def api_health():
+    if _fatal_error:
+        raise HTTPException(503, _fatal_error)
+    try:
+        import torch
+        # Exercise CUDA; an HTTP server surviving a lost GPU is not healthy.
+        torch.empty(1, device='cuda').add_(1)
+        torch.cuda.synchronize()
+    except Exception:
+        raise HTTPException(503, 'CUDA unavailable') from None
+    return {'status': 'ok'}
 
 
 @api.post("/api/generate")
@@ -771,7 +814,10 @@ def api_generate(req: GenerateRequest):
     if any(not url.startswith(("http://", "https://")) for url in req.reference_image_urls + req.reference_video_urls + req.reference_audio_urls):
         raise HTTPException(422, "Reference images must be HTTP(S) URLs.")
 
-    job_id = uuid.uuid4().hex[:12]
+    if _fatal_error:
+        raise HTTPException(503, _fatal_error)
+    job_id = JobStore.identity(req.idempotency_key) if req.idempotency_key else uuid.uuid4().hex[:12]
+    fingerprint = JobStore.fingerprint(req.model_dump(exclude={'idempotency_key'}))
     sequence = next(_job_sequence)
     params = req.model_dump(
         exclude={
@@ -791,6 +837,7 @@ def api_generate(req: GenerateRequest):
         params["reference_image_count"] = len(req.reference_image_urls)
     job = {
         "job_id": job_id,
+        "fingerprint": fingerprint,
         "status": "queued",
         "created": time.time(),
         "priority": req.priority,
@@ -799,6 +846,14 @@ def api_generate(req: GenerateRequest):
         "params": params,
     }
     with _jobs_lock:
+        existing = _jobs.get(job_id) or _job_store.get(job_id)
+        if existing:
+            if existing.get('fingerprint') != fingerprint:
+                raise HTTPException(409, 'Idempotency key was used with a different request')
+            return {'job_id': job_id, 'status_url': f'/api/jobs/{job_id}', 'priority': existing['priority']}
+        if sum(j['status'] in ('queued', 'running', 'cancelling') for j in _jobs.values()) >= MAX_PENDING_JOBS:
+            raise HTTPException(429, 'Inference queue is full')
+        _job_store.save(job)
         _jobs[job_id] = job
         # Drop oldest finished jobs beyond the cap (their mp4s stay on disk).
         if len(_jobs) > MAX_JOBS_KEPT:
@@ -825,7 +880,7 @@ def api_jobs():
 @api.get("/api/jobs/{job_id}")
 def api_job(job_id: str):
     with _jobs_lock:
-        job = _jobs.get(job_id)
+        job = _jobs.get(job_id) or _job_store.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job id.")
     return _job_public(job)
@@ -846,13 +901,14 @@ def api_cancel_job(job_id: str):
         else:
             job["status"] = "cancelling"
             job["error"] = "Cancel requested"
+        _job_store.save(job)
     return _job_public(job)
 
 
 @api.get("/api/jobs/{job_id}/video")
 def api_job_video(job_id: str):
     with _jobs_lock:
-        job = _jobs.get(job_id)
+        job = _jobs.get(job_id) or _job_store.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job id.")
     if job["status"] != "done":
@@ -1002,6 +1058,6 @@ if __name__ == "__main__":
     app = gr.mount_gradio_app(api, demo, path="/")
     uvicorn.run(
         app,
-        host=os.environ.get("MINIMAX_H3_HOST", "0.0.0.0"),
+        host=os.environ.get("MINIMAX_H3_HOST", "127.0.0.1"),
         port=int(os.environ.get("MINIMAX_H3_PORT", "7860")),
     )

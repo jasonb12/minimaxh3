@@ -113,3 +113,25 @@ Measured on Turbo 960×544/5.2s jobs: 37s for a pre-encoded job versus 56–68s
 for one that swaps models itself. `elapsed_seconds` on a job excludes the time
 spent pre-encoding others. Prefetch only pairs jobs of the same task (FL2VA or
 Ref2VA); a mode switch still reloads the transformer partition.
+
+## Recovery contract (8 September 2026)
+
+Workers send `idempotency_key` on `POST /api/generate`. Reusing a key with the
+same request returns the original job, including after a restart; changing the
+request returns 409. Supabase signed-storage token refreshes preserve input
+identity. Use the durable provider job ID as the key across lease retries; a
+new business retry creates a new provider job. Receipts are atomically persisted
+in `outputs/api/manifests`, alongside the existing output volume. Interrupted
+jobs become errors on restart; completed videos retain lookup/download access.
+Do not remove manifests while those jobs can still be retried.
+
+`GET /api/health` exercises CUDA and returns 503 when unavailable. Fatal CUDA
+errors stop admissions and exit the process after persisting the failed job;
+Docker restarts the process. A failed host GPU still requires operator repair,
+and workers must check health before claiming another job.
+
+Set `MINIMAX_H3_TOKEN` to enforce Bearer authentication on all `/api/*` routes
+except health. Direct startup now binds loopback by default. Container access
+uses the configured host binding; LAN deployments must configure the token.
+Queue admissions are capped at eight pending/running jobs and canvas/output
+sizes and prompt length are bounded.
