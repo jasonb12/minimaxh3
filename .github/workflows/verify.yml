@@ -11,3 +11,4 @@ jobs:
       - run: python -m compileall -q app.py job_store.py benchmark_timing.py reference_sizing.py generate.py spark.py turbo.py
       - run: python -m unittest discover -s tests -p test_job_store.py
       - run: python -m unittest discover -s tests -p test_benchmark_timing.py
+      - run: python -m unittest discover -s tests -p test_reference_sizing.py

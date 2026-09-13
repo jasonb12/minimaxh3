@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import importlib.util
 import unittest
 
 from reference_sizing import apply_reference_policy, reference_dimensions
@@ -27,6 +28,7 @@ class ReferenceSizingTests(unittest.TestCase):
     def test_default_is_an_exact_noop(self):
         self.assertEqual(apply_reference_policy(None, None, None), [])
 
+    @unittest.skipUnless(importlib.util.find_spec('diffusers'), 'Pinned Diffusers runtime required')
     def test_real_pipeline_state_preserves_originals_order_and_other_modalities(self):
         from diffusers.image_processor import VaeImageProcessor
         from diffusers.modular_pipelines import PipelineState
@@ -48,6 +50,7 @@ class ReferenceSizingTests(unittest.TestCase):
         self.assertIs(state.get('references')[0], original)
         self.assertEqual(metadata, [{'index': 0, 'original': [832, 480], 'effective': [832, 480]}])
 
+    @unittest.skipUnless(importlib.util.find_spec('diffusers'), 'Pinned Diffusers runtime required')
     def test_real_upstream_setup_is_replaced_before_encoding(self):
         from diffusers.image_processor import VaeImageProcessor
         from diffusers.modular_pipelines import PipelineState
