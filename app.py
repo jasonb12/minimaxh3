@@ -39,7 +39,8 @@ import gradio as gr
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from job_store import JobStore, is_fatal_cuda
-from benchmark_timing import phase, record_generation
+from benchmark_timing import phase, record_generation, record_reference_sizes
+from reference_sizing import apply_reference_policy
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
@@ -261,7 +262,18 @@ def _run_blocks(pipe, state, names):
 
 def _encode_conditioning(pipe, kwargs: dict):
     """Run the conditioner stage; park the embeddings on the CPU until denoise."""
-    state = _run_blocks(pipe, _pipeline_state(pipe, kwargs), _CONDITIONING_BLOCKS)
+    state = _run_blocks(pipe, _pipeline_state(pipe, kwargs), ('before_encode',))
+    policy = kwargs.get('_h3_reference_policy')
+    if policy is not None:
+        with phase('reference_preprocessing'):
+            dimensions = apply_reference_policy(pipe, state, policy)
+        record_reference_sizes(policy, dimensions)
+    elif state.get('normalized_references') is not None:
+        record_reference_sizes('legacy-2048', [
+            {'index': index, 'effective': list(entry.image.size)}
+            for index, entry in enumerate(state.get('normalized_references')) if entry.kind == 'image'
+        ])
+    state = _run_blocks(pipe, state, ('text_encoder',))
     state.set("prompt_embeds", state.get("prompt_embeds").cpu())
     return state
 
@@ -542,6 +554,8 @@ _job_queue: queue.PriorityQueue = queue.PriorityQueue()
 class GenerateRequest(BaseModel):
     idempotency_key: str | None = Field(None, min_length=1, max_length=200)
     mode: Literal["ref2va", "fl2va"] | None = None
+    reference_policy: Literal['bounded-1024-v1', 'match-output-v1'] | None = Field(
+        None, description='Experimental Ref2VA image preprocessing; omitted preserves original 2048-short-edge behavior')
     auto_canvas: bool = False
     reference_video_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_VIDEOS)
     reference_audio_urls: list[str] = Field(default_factory=list, max_length=MAX_REF_AUDIOS)
@@ -656,6 +670,8 @@ def _job_plan(req: "GenerateRequest", seed: int) -> dict:
         kwargs["width"] = int(os.environ["MINIMAX_H3_DEFAULT_WIDTH"])
         kwargs["height"] = int(os.environ["MINIMAX_H3_DEFAULT_HEIGHT"])
     if _job_task(req) == "ref2va":
+        if req.reference_policy is not None:
+            kwargs['_h3_reference_policy'] = req.reference_policy
         kwargs["references"] = build_references(
             [("image", url) for url in req.reference_image_urls]
             + [("video", url) for url in req.reference_video_urls]
@@ -812,6 +828,11 @@ def api_health():
 
 @api.post("/api/generate")
 def api_generate(req: GenerateRequest):
+    if req.reference_policy is not None:
+        if os.environ.get('MINIMAX_H3_REFERENCE_EXPERIMENTS') != '1':
+            raise HTTPException(422, 'Experimental reference policies are disabled on this server')
+        if _job_task(req) != 'ref2va' or not req.reference_image_urls:
+            raise HTTPException(422, 'Reference policy requires Ref2VA image references')
     if (req.width is None) != (req.height is None):
         raise HTTPException(422, "Provide both width and height, or neither.")
     if req.width and (req.width % 32 or req.height % 32):
@@ -831,7 +852,10 @@ def api_generate(req: GenerateRequest):
     if _fatal_error:
         raise HTTPException(503, _fatal_error)
     job_id = JobStore.identity(req.idempotency_key) if req.idempotency_key else uuid.uuid4().hex[:12]
-    fingerprint = JobStore.fingerprint(req.model_dump(exclude={'idempotency_key'}))
+    excluded = {'idempotency_key'}
+    if req.reference_policy is None:
+        excluded.add('reference_policy')
+    fingerprint = JobStore.fingerprint(req.model_dump(exclude=excluded))
     sequence = next(_job_sequence)
     params = req.model_dump(
         exclude={

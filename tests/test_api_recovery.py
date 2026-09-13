@@ -7,6 +7,22 @@ from job_store import JobStore
 
 
 class ApiRecoveryTests(unittest.TestCase):
+    def test_reference_experiments_are_explicit_and_preserve_old_fingerprints(self):
+        candidate = app.GenerateRequest(prompt='Test', reference_image_urls=['https://example.com/reference.png'],
+                                        reference_policy='match-output-v1')
+        with patch.dict('os.environ', {'MINIMAX_H3_REFERENCE_EXPERIMENTS': '0'}):
+            with self.assertRaises(app.HTTPException) as unavailable:
+                app.api_generate(candidate)
+            self.assertEqual(unavailable.exception.status_code, 422)
+        with tempfile.TemporaryDirectory() as root, patch.object(app, '_jobs', {}), patch.object(app, '_job_queue'), patch.object(app, '_job_store', JobStore(root)):
+            legacy = app.GenerateRequest(prompt='Test', idempotency_key='legacy-replay')
+            receipt = app.api_generate(legacy)
+            historical = legacy.model_dump(exclude={'idempotency_key', 'reference_policy'})
+            self.assertEqual(app._jobs[receipt['job_id']]['fingerprint'], JobStore.fingerprint(historical))
+        with patch.dict('os.environ', {'MINIMAX_H3_REFERENCE_EXPERIMENTS': '1'}):
+            with self.assertRaises(app.HTTPException):
+                app.api_generate(app.GenerateRequest(prompt='Test', reference_policy='match-output-v1'))
+
     def test_health_does_not_synchronize_an_active_render(self):
         with app._gen_lock, patch('torch.cuda.synchronize') as synchronize:
             self.assertEqual(app.api_health(), {'status': 'ok', 'inference': 'busy'})

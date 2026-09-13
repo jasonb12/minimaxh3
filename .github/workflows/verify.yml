@@ -8,6 +8,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m compileall -q app.py job_store.py benchmark_timing.py generate.py spark.py turbo.py
+      - run: python -m compileall -q app.py job_store.py benchmark_timing.py reference_sizing.py generate.py spark.py turbo.py
       - run: python -m unittest discover -s tests -p test_job_store.py
       - run: python -m unittest discover -s tests -p test_benchmark_timing.py

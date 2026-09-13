@@ -11,6 +11,12 @@ import time
 _trace = contextvars.ContextVar('h3_benchmark_trace', default=None)
 
 
+def record_reference_sizes(policy, dimensions):
+    trace = _trace.get()
+    if trace is not None:
+        trace.setdefault('reference_preprocessing', []).append({'policy': policy, 'images': dimensions})
+
+
 def _synchronize():
     import torch
     torch.cuda.synchronize()
@@ -58,6 +64,7 @@ def record_generation(function):
             'width': settings.get('width'),
             'height': settings.get('height'),
             'num_frames': settings.get('num_frames'),
+            'reference_policy': settings.get('_h3_reference_policy', 'legacy-2048'),
             'phases': [],
         }
         token = _trace.set(trace)

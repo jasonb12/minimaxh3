@@ -5,7 +5,7 @@ FROM ${BASE_IMAGE}
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision=$SOURCE_REVISION
 WORKDIR /app
-COPY app.py job_store.py benchmark_timing.py gradio_queue.py generate.py spark.py turbo.py queue_generate.py download_spark.py ./
+COPY app.py job_store.py benchmark_timing.py reference_sizing.py gradio_queue.py generate.py spark.py turbo.py queue_generate.py download_spark.py ./
 COPY docker/smoke.py docker/reuse_smoke.py ./
 COPY tests ./tests
 RUN python -c "from pathlib import Path; [compile(p.read_text(), str(p), 'exec') for p in Path('.').glob('*.py')]"
