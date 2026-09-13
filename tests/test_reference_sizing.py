@@ -47,3 +47,23 @@ class ReferenceSizingTests(unittest.TestCase):
         self.assertIs(state.get('normalized_references')[1], normalized_audio)
         self.assertIs(state.get('references')[0], original)
         self.assertEqual(metadata, [{'index': 0, 'original': [832, 480], 'effective': [832, 480]}])
+
+    def test_real_upstream_setup_is_replaced_before_encoding(self):
+        from diffusers.image_processor import VaeImageProcessor
+        from diffusers.modular_pipelines import PipelineState
+        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
+        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+        from PIL import Image
+        picture = Image.new('RGB', (832, 480), 'blue')
+        state = PipelineState()
+        for name, value in {'references': [MiniMaxH3ImageReference(image=picture)],
+                            'width': 832, 'height': 480, 'num_frames': 124}.items():
+            state.set(name, value)
+        pipe = SimpleNamespace(image_processor=VaeImageProcessor(vae_scale_factor=16), canvas_multiple=32,
+                               config=SimpleNamespace(reference_image_short_edge=2048), fps=24,
+                               vae_frames_per_chunk=17, vae_latents_per_chunk=5, min_duration=5, max_duration=15)
+        MiniMaxH3Ref2VASetupStep()(pipe, state)
+        self.assertEqual(state.get('normalized_references')[0].image.size, (3552, 2048))
+        apply_reference_policy(pipe, state, 'match-output-v1')
+        self.assertIs(state.get('normalized_references')[0].image, picture)
+        self.assertEqual((state.get('width'), state.get('height'), state.get('num_frames')), (832, 480, 124))
