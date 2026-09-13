@@ -39,6 +39,7 @@ import gradio as gr
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from job_store import JobStore, is_fatal_cuda
+from benchmark_timing import phase, record_generation
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
@@ -253,7 +254,8 @@ def _run_blocks(pipe, state, names):
     blocks = pipe._blocks.sub_blocks
     with torch.no_grad():
         for name in names:
-            _, state = blocks[name](pipe, state)
+            with phase(f'block:{name}', gpu=True):
+                _, state = blocks[name](pipe, state)
     return state
 
 
@@ -384,6 +386,7 @@ def _job_cancel_requested(job_id: str | None) -> bool:
         return bool(job and job.get("cancel_requested"))
 
 
+@record_generation
 def _run_generation(
     task,
     kwargs,
@@ -417,7 +420,8 @@ def _run_generation(
     with _gen_lock:
         if _job_cancel_requested(job_id):
             raise GenerationCancelled(job_id)
-        pipe = _get_pipe(task)
+        with phase('model_load_or_switch', gpu=True):
+            pipe = _get_pipe(task)
         from turbo import load_turbo_lora, set_turbo_enabled
 
         denoiser = getattr(pipe, "transformer_ref", None) or pipe.transformer
@@ -426,20 +430,21 @@ def _run_generation(
         set_turbo_enabled(denoiser, turbo)
         from spark import prepare_spark_transformer
 
-        prepare_spark_transformer(pipe)
+        with phase('compile_setup', gpu=True):
+            prepare_spark_transformer(pipe)
         denoiser = _install_exclusive_gpu_guard(pipe)
 
         generator = kwargs["generator"]
         num_inference_steps = kwargs["num_inference_steps"]
         encode_kwargs = {k: v for k, v in kwargs.items() if k != "generator"}
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         import torch
         torch.cuda.reset_peak_memory_stats()
         prefetch_seconds = 0.0
         if conditioning is None:
             conditioning = _encode_conditioning(pipe, encode_kwargs)
-            t_prefetch = time.time()
+            t_prefetch = time.perf_counter()
             for other_job, other_kwargs in prefetch() if prefetch else ():
                 if _job_cancel_requested(other_job["job_id"]):
                     continue
@@ -452,12 +457,12 @@ def _run_generation(
                     continue
                 with _jobs_lock:
                     other_job["conditioning"] = {"task": task, "state": other_state}
-            prefetch_seconds = time.time() - t_prefetch
+            prefetch_seconds = time.perf_counter() - t_prefetch
         torch.cuda.synchronize()
-        conditioning_seconds = time.time() - t0 - prefetch_seconds
+        conditioning_seconds = time.perf_counter() - t0 - prefetch_seconds
         state = _denoise_from_conditioning(pipe, conditioning, generator, num_inference_steps)
         torch.cuda.synchronize()
-        elapsed = time.time() - t0 - prefetch_seconds
+        elapsed = time.perf_counter() - t0 - prefetch_seconds
         if getattr(pipe, "_h3_resident", False):
             components = {
                 name: sorted({str(p.device) for p in model.parameters()})
@@ -471,19 +476,21 @@ def _run_generation(
                   f"devices={components}", flush=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    video = _normalize_output_video(
-        state.get("videos")[0],
-        output_width,
-        output_height,
-        output_duration_seconds,
-    )
-    encode_video(
-        video,
-        fps=24,
-        output_path=str(out_path),
-        audio=state.get("audio")[0] if include_audio else None,
-        audio_sample_rate=state.get("sampling_rate") if include_audio else None,
-    )
+    with phase('output_normalization'):
+        video = _normalize_output_video(
+            state.get("videos")[0],
+            output_width,
+            output_height,
+            output_duration_seconds,
+        )
+    with phase('media_encoding'):
+        encode_video(
+            video,
+            fps=24,
+            output_path=str(out_path),
+            audio=state.get("audio")[0] if include_audio else None,
+            audio_sample_rate=state.get("sampling_rate") if include_audio else None,
+        )
     return elapsed
 
 
